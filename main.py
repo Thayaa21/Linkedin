@@ -1,0 +1,234 @@
+"""
+main.py — Scheduler entry point.
+
+Two jobs run on separate schedules:
+  1. poll_connections()   — every POLL_INTERVAL_HOURS hours
+                            Scrapes LinkedIn connections, diffs vs snapshot,
+                            matches new connections to sheet companies,
+                            marks matched rows as "Pending Message".
+
+  2. send_messages()      — weekdays at SEND_HOUR (default 9 AM)
+                            Sends DMs to all "Pending Message" rows,
+                            writes status back to sheet.
+
+Usage:
+    python main.py
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from playwright.async_api import async_playwright
+
+import sheets
+import drive
+import linkedin as li
+import matcher as m
+from config import (
+    POLL_INTERVAL_HOURS,
+    SEND_HOUR,
+    MESSAGE_TEMPLATE,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("main")
+
+
+# ─── Job 1: Poll connections ──────────────────────────────────────────────────
+
+async def poll_connections():
+    """
+    Scrapes current LinkedIn 1st-degree connections, diffs against the last
+    snapshot, and for each newly accepted connection tries to match it to a
+    company row in the sheet.
+    """
+    logger.info("=== poll_connections started ===")
+
+    async with async_playwright() as p:
+        browser, context = await li.make_browser_context(p)
+        try:
+            # Load saved cookies
+            ok = await li.load_cookies(context)
+            if not ok:
+                logger.error("No cookies available. Run save_cookies.py first.")
+                return
+
+            page = await context.new_page()
+
+            # Verify session is still valid
+            if not await li.is_logged_in(page):
+                logger.error("LinkedIn session expired. Re-run save_cookies.py.")
+                return
+
+            # Scrape current connections
+            current = await li.get_connections(page)
+
+            # Diff against previous snapshot
+            old_snapshot = li.load_snapshot()
+            new_connections = li.diff_connections(old_snapshot, current)
+            logger.info("New connections since last poll: %d", len(new_connections))
+
+            if new_connections:
+                # Load sheet rows that are still in "Applied" state
+                applied_rows = sheets.get_applied_companies()
+                logger.info("Applied rows in sheet: %d", len(applied_rows))
+
+                for conn in new_connections:
+                    company_hint = m.extract_company_from_headline(conn["headline"])
+                    logger.info(
+                        "New connection: %s | headline: %s | extracted company: %s",
+                        conn["name"], conn["headline"], company_hint,
+                    )
+
+                    matched_row = m.find_matching_row(company_hint, applied_rows)
+                    if matched_row:
+                        logger.info(
+                            "Matched! %s → row %d (%s @ %s)",
+                            conn["name"], matched_row["row_index"],
+                            matched_row["role"], matched_row["company"],
+                        )
+                        sheets.mark_pending(
+                            row_index=matched_row["row_index"],
+                            li_name=conn["name"],
+                            li_url=conn["url"],
+                        )
+                    else:
+                        logger.info("No sheet match for connection: %s", conn["name"])
+
+            # Always update snapshot with full current state
+            li.save_snapshot(current)
+
+        finally:
+            await browser.close()
+
+    logger.info("=== poll_connections complete ===")
+
+
+# ─── Job 2: Send messages ─────────────────────────────────────────────────────
+
+async def send_messages():
+    """
+    Sends DMs to all rows marked 'Pending Message'.
+    Only runs on weekdays — APScheduler cron handles the day filter,
+    but we double-check here for safety.
+    """
+    today = datetime.now()
+    if today.weekday() >= 5:   # 5=Sat, 6=Sun
+        logger.info("send_messages: skipping — weekend")
+        return
+
+    logger.info("=== send_messages started ===")
+    pending = sheets.get_pending_rows()
+    logger.info("Pending rows to message: %d", len(pending))
+
+    if not pending:
+        logger.info("Nothing to send.")
+        return
+
+    async with async_playwright() as p:
+        browser, context = await li.make_browser_context(p)
+        try:
+            ok = await li.load_cookies(context)
+            if not ok:
+                logger.error("No cookies. Run save_cookies.py first.")
+                return
+
+            page = await context.new_page()
+
+            if not await li.is_logged_in(page):
+                logger.error("LinkedIn session expired. Re-run save_cookies.py.")
+                return
+
+            for row in pending:
+                profile_url = row["li_url"]
+                company     = row["company"]
+                role        = row["role"]
+                li_name     = row["li_name"]
+                first_name  = li_name.split()[0] if li_name else "there"
+
+                # Step 5: fetch resume link from Drive
+                resume_link = drive.get_resume_link(company)
+                if not resume_link:
+                    logger.warning("No resume for %s — skipping DM, marking No Resume", company)
+                    sheets.mark_no_resume(row["row_index"])
+                    continue
+
+                # Build personalised message
+                message = MESSAGE_TEMPLATE.format(
+                    first_name=first_name,
+                    company=company,
+                    role=role,
+                    resume_link=resume_link,
+                )
+
+                # Step 6: send DM
+                success = await li.send_message(page, profile_url, message)
+
+                # Step 7: log result back to sheet
+                if success:
+                    sheets.mark_sent(row["row_index"])
+                else:
+                    # Leave as Pending — will retry next send window
+                    logger.warning("Failed to send to %s, will retry next run.", li_name)
+
+        finally:
+            await browser.close()
+
+    logger.info("=== send_messages complete ===")
+
+
+# ─── Scheduler setup ──────────────────────────────────────────────────────────
+
+async def main():
+    scheduler = AsyncIOScheduler()
+
+    # Poll connections every N hours
+    scheduler.add_job(
+        poll_connections,
+        trigger=IntervalTrigger(hours=POLL_INTERVAL_HOURS),
+        id="poll_connections",
+        name="Poll LinkedIn connections",
+        next_run_time=datetime.now(),  # run immediately on startup
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # Send messages at SEND_HOUR on Mon–Fri
+    scheduler.add_job(
+        send_messages,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=SEND_HOUR,
+            minute=0,
+        ),
+        id="send_messages",
+        name="Send LinkedIn DMs",
+        coalesce=True,
+        max_instances=1,
+    )
+
+    scheduler.start()
+    logger.info(
+        "Scheduler running. Polling every %dh, sending at %d:00 Mon–Fri.",
+        POLL_INTERVAL_HOURS, SEND_HOUR,
+    )
+
+    # Keep the event loop alive
+    try:
+        while True:
+            await asyncio.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutting down.")
+        scheduler.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
