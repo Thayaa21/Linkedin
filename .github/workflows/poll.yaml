@@ -17,9 +17,10 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          sudo apt-get install -y libasound2t64
           playwright install chromium
           playwright install-deps chromium
-
+          
       - name: Write credentials
         run: |
           echo '${{ secrets.GOOGLE_CREDS_JSON }}' > google_creds.json
