@@ -17,8 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          sudo apt-get install -y libasound2t64 libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 libwoff1 libvpx9 libevent-2.1-7t64 libopus0 libwebpdemux2 libharfbuzz-icu0 libhyphen0 libmanette-0.2-0
-          playwright install chromium
+          playwright install --with-deps chromium
 
       - name: Write credentials
         run: |
