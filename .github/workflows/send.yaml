@@ -1,0 +1,34 @@
+name: Send LinkedIn Messages
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Write credentials
+        run: |
+          echo '${{ secrets.GOOGLE_CREDS_JSON }}' > google_creds.json
+          echo '${{ secrets.LINKEDIN_COOKIES }}' > linkedin_cookies.json
+
+      - name: Run send
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_TAB: ${{ secrets.SHEET_TAB }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          GOOGLE_CREDS_FILE: google_creds.json
+          COOKIES_FILE: linkedin_cookies.json
+        run: python -c "import asyncio; from main import send_messages; asyncio.run(send_messages())"
