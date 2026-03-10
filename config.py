@@ -27,11 +27,11 @@ SEND_HOUR           = int(os.environ.get('SEND_HOUR', '9'))   # 9 AM local time
 MESSAGE_TEMPLATE = os.environ.get('MESSAGE_TEMPLATE', """\
 Hi {first_name},
 
-I recently applied to the {role} position at {company} and noticed we're connected on LinkedIn — small world!
+I'm interested in applying for the {role} position at {company}. I know a lot of people use AI to 'game' the application process, but I'm taking a different route. My resume reflects my actual, raw experience, even where it doesn't perfectly mirror the JD. I'd rather be hired for my real-world problem-solving than for a perfectly tailored document.
 
-I'd love to learn more about the team and share a bit about my background. I put together a resume tailored for this role if you'd like to take a look: {resume_link}
+If you're willing to refer me, I'm confident I can prove my value in the technical rounds. I'd love to make sure your recommendation is one you're proud of.
 
-Would really appreciate any insight you might have. Thanks for your time!\
+Here's my resume if you'd like to take a look: {resume_link}\
 """)
 
 # ─── Matching ────────────────────────────────────────────────────────────────
