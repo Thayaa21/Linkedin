@@ -1,8 +1,8 @@
 """
 drive.py — Fetches the shareable link for {Company}_Resume.pdf from Google Drive.
 
-Resumes must be named exactly:  {Company}_Resume.pdf
-e.g.  Stripe_Resume.pdf, Google_Resume.pdf, Acme Corp_Resume.pdf
+Resumes must be named exactly:  Thayaa_{Company}.pdf
+e.g.  Thayaa_Stripe.pdf, Thayaa_Google.pdf, Thayaa_Acme Corp.pdf
 
 The Drive folder is set via DRIVE_FOLDER_ID in .env.
 Files must have "Anyone with the link can view" sharing already set —
@@ -50,10 +50,10 @@ def get_resume_link(company: str) -> str | None:
     ).execute()
 
     files = results.get("files", [])
-    target = _normalize(f"{company}_resume")
+    target = _normalize(f"thayaa_{company}")
 
     for f in files:
-        stem = _normalize(f["name"].replace(".pdf", ""))
+        stem = _normalize(f["name"].replace(".pdf", "").replace(".PDF", ""))
         if stem == target:
             link = f.get("webViewLink")
             logger.info("Found resume for %s: %s", company, link)
