@@ -95,18 +95,14 @@ async def get_connections(page: Page) -> dict[str, dict]:
         return {}
 
     # Call LinkedIn's internal Voyager API for 50 most recently added connections.
-    # We try two endpoints and two Accept headers (plain JSON is easier to parse).
+    # The dash endpoint with plain JSON returns only URNs (no profile data).
+    # Normalized JSON bundles actual Profile objects in `included[]` — use that.
     logger.info("Calling LinkedIn Voyager API for connections...")
     result = await page.evaluate("""
         async (csrfToken) => {
-            // Attempt 1: dash endpoint, plain JSON (no normalization)
-            // Attempt 2: dash endpoint, normalized JSON
-            // Attempt 3: legacy endpoint, plain JSON
+            // Attempt 1: dash endpoint with normalized JSON → profiles in included[]
+            // Attempt 2: legacy endpoint with plain JSON → may embed profile data
             const attempts = [
-                {
-                    url: '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
-                    accept: 'application/json',
-                },
                 {
                     url: '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
                     accept: 'application/vnd.linkedin.normalized+json+2.1',
@@ -128,15 +124,27 @@ async def get_connections(page: Page) -> dict[str, dict]:
                         credentials: 'include'
                     });
                     const body = await resp.text();
-                    // Always log the first 600 chars so we can see the shape
                     console.log('API ' + attempt.url.split('?')[0] +
                                 ' accept=' + attempt.accept.split('/').pop() +
                                 ' status=' + resp.status +
-                                ' preview=' + body.slice(0, 600));
+                                ' preview=' + body.slice(0, 800));
                     if (!resp.ok) {
                         continue;
                     }
                     const parsed = JSON.parse(body);
+
+                    // Skip responses that only contain URN elements (no profile data).
+                    // dash+plain-JSON returns {elements:[{connectedMember:"urn:...", ...}]}
+                    // which has no names/headlines — useless for us.
+                    const topElements = Array.isArray(parsed.elements) ? parsed.elements : [];
+                    const hasProfileData =
+                        topElements.some(e => e.connectedMemberResolutionResult || e.publicIdentifier) ||
+                        (Array.isArray(parsed.included) && parsed.included.some(e => e.publicIdentifier));
+                    if (topElements.length > 0 && !hasProfileData) {
+                        console.log('Skipping: elements contain only URNs, no profile data — trying next');
+                        continue;
+                    }
+
                     return { ok: true, accept: attempt.accept, parsed: parsed };
                 } catch(e) {
                     console.log('API exception ' + attempt.url + ': ' + e.message);
@@ -155,31 +163,37 @@ async def get_connections(page: Page) -> dict[str, dict]:
     top_keys = list(data.keys()) if isinstance(data, dict) else []
     logger.info("API response top-level keys: %s (accept=%s)", top_keys, accept_used)
 
-    # ── Parse plain-JSON response  (elements[] at top level) ──────────────────
-    raw_elements = data.get("elements", [])
+    # ── Plain-JSON: elements[] at top level with embedded profile data ─────────
+    raw_elements = []
+    plain_elements = data.get("elements", [])
+    if plain_elements and any(
+        e.get("connectedMemberResolutionResult") or e.get("publicIdentifier")
+        for e in plain_elements
+    ):
+        raw_elements = plain_elements
+        logger.info("Using plain-JSON elements: %d", len(raw_elements))
 
-    # ── Parse normalized-JSON response (included[] at top level) ──────────────
-    # In normalized format the connection objects sit in `included` alongside
-    # profile objects; we pick only Connection-typed entries.
+    # ── Normalized-JSON: profile objects live in included[] ────────────────────
     if not raw_elements:
         included = data.get("included", [])
-        logger.info("Plain JSON elements=0, trying included[] (%d items)", len(included))
-        raw_elements = [
+        logger.info("Checking included[] (%d items) for profile data", len(included))
+
+        # Prefer Connection-typed objects (they hold the profile inside)
+        conn_items = [
+            item for item in included
+            if isinstance(item, dict) and "connection" in item.get("$type", "").lower()
+        ]
+        # Profile-typed objects with a publicIdentifier work too
+        profile_items = [
             item for item in included
             if isinstance(item, dict)
-            and "connection" in item.get("$type", "").lower()
+            and "profile" in item.get("$type", "").lower()
+            and item.get("publicIdentifier")
         ]
-        if not raw_elements:
-            # Last resort: grab *all* Profile objects from included
-            raw_elements = [
-                item for item in included
-                if isinstance(item, dict)
-                and "profile" in item.get("$type", "").lower()
-                and item.get("publicIdentifier")
-            ]
-            logger.info("Connection objects=0, falling back to Profile objects: %d", len(raw_elements))
+        logger.info("  Connection items: %d, Profile items: %d", len(conn_items), len(profile_items))
+        raw_elements = conn_items if conn_items else profile_items
 
-    logger.info("API returned %d connection elements to parse", len(raw_elements))
+    logger.info("Connection elements to parse: %d", len(raw_elements))
 
     connections: dict[str, dict] = {}
     for element in raw_elements:
@@ -187,7 +201,7 @@ async def get_connections(page: Page) -> dict[str, dict]:
             # Plain-JSON dash endpoint wraps the profile under this key
             profile = element.get("connectedMemberResolutionResult") or {}
 
-            # Normalized / profile-object fallback: the element itself IS the profile
+            # Normalized profile object: the element itself carries the data
             if not profile and element.get("publicIdentifier"):
                 profile = element
 
