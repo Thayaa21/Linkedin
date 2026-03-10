@@ -139,21 +139,32 @@ async def get_connections(page: Page) -> dict[str, dict]:
     # Navigate — LinkedIn's app will fetch connections + mini-profiles automatically
     logger.info("Navigating to connections page (intercepting API traffic)...")
     await page.goto(CONNECTIONS_URL, wait_until="domcontentloaded")
-    await _pause(5, 7)   # give JS time to fire all the API calls
+    await _pause(3, 5)
+
+    # Scroll down so LinkedIn lazy-loads the rest of the connection cards.
+    # Each scroll triggers LinkedIn's own API calls for mini-profiles, which
+    # our interceptor captures (including current company / position data).
+    logger.info("Scrolling to trigger lazy-loaded profile API calls...")
+    for scroll_i in range(12):
+        await page.evaluate("window.scrollBy(0, 600)")
+        await asyncio.sleep(1.2)
+        if len(intercepted_profiles) >= 45:
+            logger.info("Enough profiles collected (%d), stopping scroll", len(intercepted_profiles))
+            break
+
+    await _pause(2, 3)  # final wait for any in-flight requests
 
     logger.info(
         "Intercepted: %d profile URNs, %d profiles with data",
         len(intercepted_connections_urns), len(intercepted_profiles),
     )
 
-    # ── Step 3: If intercepted profiles are sparse, do a manual Voyager fetch ──
-    # Sometimes LinkedIn doesn't fire the profile detail calls immediately.
-    # Fall back to calling the connections + miniProfiles APIs ourselves.
+    # ── Step 3: If scrolling didn't yield profiles, fall back to API ──────────
     if len(intercepted_profiles) < 5:
-        logger.info("Few profiles intercepted — calling Voyager API directly...")
+        logger.info("Still few profiles after scroll — calling Voyager API directly...")
         api_result = await page.evaluate("""
             async (csrfToken) => {
-                // Step A: get connection URNs
+                // Get connection URNs first
                 const connResp = await fetch(
                     '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
                     {
@@ -172,53 +183,64 @@ async def get_connections(page: Page) -> dict[str, dict]:
                     .filter(e => e.$type && e.$type.toLowerCase().includes('connection') && e.connectedMember)
                     .map(e => e.connectedMember);
 
-                console.log('Connection URNs found: ' + memberUrns.length);
-                if (!memberUrns.length) return { ok: false, error: 'no connection URNs' };
+                console.log('Connection URNs: ' + memberUrns.length);
+                if (!memberUrns.length) return { ok: false, error: 'no URNs' };
 
-                // Step B: batch-fetch miniProfiles for those URNs
-                // Profile IDs are everything after the last colon in the URN
-                const profileIds = memberUrns.map(u => u.split(':').pop());
-                const ids = profileIds.map(encodeURIComponent).join(',');
+                // Try several batch-profile endpoint formats — LinkedIn changes these
+                const profileIds  = memberUrns.map(u => u.split(':').pop());
+                const encodedUrns = memberUrns.map(encodeURIComponent).join(',');
+                const encodedIds  = profileIds.map(encodeURIComponent).join(',');
 
-                const miniUrl = '/voyager/api/identity/miniProfiles?ids=List(' + ids + ')';
-                const miniResp = await fetch(miniUrl, {
-                    headers: {
-                        'Accept': 'application/json',
-                        'csrf-token': csrfToken,
-                        'x-restli-protocol-version': '2.0.0',
-                    },
-                    credentials: 'include',
-                });
-                const miniBody = await miniResp.text();
-                console.log('MiniProfiles status=' + miniResp.status + ' preview=' + miniBody.slice(0, 400));
+                const endpoints = [
+                    // New dash format with full URNs
+                    '/voyager/api/identity/dash/profiles?ids=List(' + encodedUrns + ')',
+                    // Old format with bare IDs
+                    '/voyager/api/identity/profiles?ids=List(' + encodedIds + ')',
+                    // miniProfile (old)
+                    '/voyager/api/identity/miniProfiles?ids=List(' + encodedIds + ')',
+                ];
 
-                if (!miniResp.ok) {
-                    // Last resort: return the raw Connection URNs so we can at least build URLs
-                    return { ok: true, urnsOnly: true, urns: memberUrns, profiles: {} };
+                for (const ep of endpoints) {
+                    try {
+                        const r = await fetch(ep, {
+                            headers: {
+                                'Accept': 'application/vnd.linkedin.normalized+json+2.1',
+                                'csrf-token': csrfToken,
+                                'x-restli-protocol-version': '2.0.0',
+                            },
+                            credentials: 'include',
+                        });
+                        const body = await r.text();
+                        console.log('Batch profiles ' + ep.split('?')[0] + ' → ' + r.status + ' ' + body.slice(0, 200));
+                        if (r.ok) return { ok: true, profiles: JSON.parse(body), urns: memberUrns };
+                    } catch(e) {
+                        console.log('Error ' + ep + ': ' + e.message);
+                    }
                 }
 
-                return { ok: true, urnsOnly: false, profiles: JSON.parse(miniBody), urns: memberUrns };
+                // All batch endpoints failed — return URNs only so we can build profile URLs
+                return { ok: true, urnsOnly: true, urns: memberUrns, profiles: {} };
             }
         """, csrf_token)
 
         if api_result and api_result.get("ok"):
-            # Add any profiles from the API call that weren't intercepted
             profiles_raw = api_result.get("profiles") or {}
-            for key, item in (profiles_raw.get("results") or {}).items():
-                if isinstance(item, dict):
-                    pid = item.get("publicIdentifier", "")
-                    if pid and pid not in intercepted_profiles:
-                        intercepted_profiles[pid] = item
+            # normalized JSON puts profiles in included[]
             for item in (profiles_raw.get("included") or []):
                 if isinstance(item, dict):
                     pid = item.get("publicIdentifier", "")
                     if pid and pid not in intercepted_profiles:
                         intercepted_profiles[pid] = item
-            # Also store URN ordering if not already set
+            # plain JSON may put them in results{}
+            for item in (profiles_raw.get("results") or {}).values():
+                if isinstance(item, dict):
+                    pid = item.get("publicIdentifier", "")
+                    if pid and pid not in intercepted_profiles:
+                        intercepted_profiles[pid] = item
             if not intercepted_connections_urns:
                 intercepted_connections_urns.extend(api_result.get("urns") or [])
 
-        logger.info("After manual fetch: %d profiles collected", len(intercepted_profiles))
+        logger.info("After API fallback: %d profiles collected", len(intercepted_profiles))
 
     # ── Step 4: Build connections dict from collected profile data ────────────
     connections: dict[str, dict] = {}
