@@ -77,21 +77,24 @@ async def get_connections(page: Page) -> dict[str, dict]:
       }
     """
     logger.info("Navigating to connections page...")
-    await page.goto(CONNECTIONS_URL, wait_until="domcontentloaded")
+    await page.goto(CONNECTIONS_URL, wait_until="networkidle")
     await _pause(3, 5)
 
-    # Debug: log page title and URL to confirm we landed on the right page
-    title = await page.title()
-    logger.info("Page title: %s | URL: %s", title, page.url)
+    # Wait for connection cards to actually render (LinkedIn loads them via JS)
+    try:
+        await page.wait_for_selector(
+            "li.mn-connection-card, "
+            "[data-view-name='connections-list-item'], "
+            ".scaffold-finite-scroll__content li",
+            timeout=15000,
+        )
+        logger.info("Connection cards detected on page.")
+    except Exception:
+        logger.warning("Timed out waiting for connection cards — page may be empty or blocked.")
 
-    # Debug: try to find the connection count header LinkedIn shows (e.g. "1,234 connections")
-    count_el = await page.query_selector("h1")
-    if count_el:
-        logger.info("Page h1: %s", (await count_el.inner_text()).strip())
-
-    # Debug: count total <li> elements on the page as a sanity check
+    # Debug: log total <li> count after waiting
     all_li = await page.query_selector_all("li")
-    logger.info("Total <li> elements on page: %d", len(all_li))
+    logger.info("Total <li> elements on page after wait: %d", len(all_li))
 
     connections: dict[str, dict] = {}
     prev_count = -1
@@ -100,7 +103,9 @@ async def get_connections(page: Page) -> dict[str, dict]:
         cards = await page.query_selector_all(
             "li.mn-connection-card, "
             "[data-view-name='connections-list-item'], "
-            ".mn-connection-card"
+            ".mn-connection-card, "
+            ".scaffold-finite-scroll__content li, "
+            ".reusable-search__result-container"
         )
 
         for card in cards:
