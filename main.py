@@ -32,6 +32,8 @@ from config import (
     POLL_INTERVAL_HOURS,
     SEND_HOUR,
     MESSAGE_TEMPLATE,
+    ENRICH_MAX_CONNECTIONS,
+    ENRICH_DELAY_SECONDS,
 )
 
 logging.basicConfig(
@@ -90,6 +92,31 @@ async def poll_connections():
                 "Headline extraction filled company for %d connections", headline_filled
             )
 
+            # ── Pass 1b: enrich from work experience API when headline has no company ─
+            # LinkedIn headlines can be vague ("Software Engineer", "AI Enthusiast").
+            # Call the profile/positions API to get current employer from experience.
+            to_enrich = [
+                conn for conn in current.values()
+                if not conn.get("current_company")
+            ][:ENRICH_MAX_CONNECTIONS]
+            if to_enrich:
+                csrf_token = await li.get_csrf_token(page)
+                enriched = 0
+                for conn in to_enrich:
+                    url = conn.get("url", "")
+                    if not url or "/in/" not in url:
+                        continue
+                    public_id = url.rstrip("/").split("/")[-1]
+                    if not public_id:
+                        continue
+                    company = await li.get_profile_company(page, public_id, csrf_token)
+                    if company:
+                        conn["current_company"] = company
+                        enriched += 1
+                        logger.info("Enriched %s → company: %s", conn["name"], company)
+                    await asyncio.sleep(ENRICH_DELAY_SECONDS)
+                logger.info("Experience API enriched %d connections (no company in headline)", enriched)
+
             # ── Load snapshot from Google Sheets (persists across GH Actions runs) ──
             old_snapshot = sheets.load_snapshot_from_sheet()
             logger.info("Snapshot loaded: %d previously seen connections", len(old_snapshot))
@@ -109,6 +136,10 @@ async def poll_connections():
                 # Load sheet rows that are still in "Applied" state
                 applied_rows = sheets.get_applied_companies()
                 logger.info("Applied rows in sheet: %d", len(applied_rows))
+
+                # Track which applied rows already have a person assigned — use
+                # add_pending_row for 2nd+ person at same company (message ALL unique people)
+                rows_with_person: set[int] = set()
 
                 for conn in new_connections:
                     headline        = conn.get("headline", "")
@@ -132,16 +163,35 @@ async def poll_connections():
                         matched_row = m.find_matching_row(current_company, applied_rows)
 
                     if matched_row:
-                        logger.info(
-                            "Matched! %s → row %d (%s @ %s)",
-                            conn["name"], matched_row["row_index"],
-                            matched_row["role"], matched_row["company"],
-                        )
-                        sheets.mark_pending(
-                            row_index=matched_row["row_index"],
-                            li_name=conn["name"],
-                            li_url=conn["url"],
-                        )
+                        row_index = matched_row["row_index"]
+                        if row_index in rows_with_person:
+                            # 2nd+ person at same company — add new row so we message both
+                            logger.info(
+                                "Matched (extra): %s → %s @ %s — adding new pending row",
+                                conn["name"], matched_row["role"], matched_row["company"],
+                            )
+                            sheets.add_pending_row(
+                                timestamp=matched_row.get("timestamp", ""),
+                                company=matched_row["company"],
+                                role=matched_row["role"],
+                                job_url=matched_row.get("url", ""),
+                                source=matched_row.get("source", ""),
+                                li_name=conn["name"],
+                                li_url=conn["url"],
+                            )
+                        else:
+                            # First person for this applied row
+                            logger.info(
+                                "Matched! %s → row %d (%s @ %s)",
+                                conn["name"], row_index,
+                                matched_row["role"], matched_row["company"],
+                            )
+                            sheets.mark_pending(
+                                row_index=row_index,
+                                li_name=conn["name"],
+                                li_url=conn["url"],
+                            )
+                            rows_with_person.add(row_index)
                     else:
                         logger.info("No sheet match for connection: %s", conn["name"])
 
