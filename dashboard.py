@@ -60,9 +60,9 @@ def load_sheet() -> pd.DataFrame:
     return pd.DataFrame(data, columns=headers)
 
 
-def trigger_workflow(workflow_file: str) -> bool:
+def trigger_workflow(workflow_file: str) -> tuple[bool, str]:
     if not GH_TOKEN or not GH_REPO:
-        return False
+        return False, "GH_TOKEN or GH_REPO not set in .env"
     url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{workflow_file}/dispatches"
     resp = requests.post(
         url,
@@ -70,7 +70,9 @@ def trigger_workflow(workflow_file: str) -> bool:
         json={"ref": "main"},
         timeout=10,
     )
-    return resp.status_code == 204
+    if resp.status_code == 204:
+        return True, ""
+    return False, f"GitHub API returned {resp.status_code}: {resp.text}"
 
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -100,11 +102,17 @@ if GH_TOKEN and GH_REPO:
     st.subheader("Manual Controls")
     c1, c2, _ = st.columns([1, 1, 6])
     if c1.button("🔄 Run Poll Now"):
-        ok = trigger_workflow("poll.yaml")
-        st.success("Poll triggered!") if ok else st.error("Failed to trigger poll.")
+        ok, err = trigger_workflow("poll.yaml")
+        if ok:
+            st.success("Poll triggered!")
+        else:
+            st.error(f"Failed to trigger poll — {err}")
     if c2.button("📨 Run Send Now"):
-        ok = trigger_workflow("send.yaml")
-        st.success("Send triggered!") if ok else st.error("Failed to trigger send.")
+        ok, err = trigger_workflow("send.yaml")
+        if ok:
+            st.success("Send triggered!")
+        else:
+            st.error(f"Failed to trigger send — {err}")
     st.divider()
 
 # ── Per-status sections ────────────────────────────────────────────────────────
