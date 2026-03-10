@@ -38,8 +38,3 @@ Here's my resume if you'd like to take a look: {resume_link}\
 # Minimum fuzzy-match score (0–100) to consider a connection's company
 # a match to a company in the sheet.
 FUZZY_THRESHOLD = int(os.environ.get('FUZZY_THRESHOLD', '80'))
-
-# ─── Experience enrichment ───────────────────────────────────────────────────
-# When headline doesn't contain company, fetch from work experience via LinkedIn API.
-ENRICH_MAX_CONNECTIONS = int(os.environ.get('ENRICH_MAX_CONNECTIONS', '50'))
-ENRICH_DELAY_SECONDS = float(os.environ.get('ENRICH_DELAY_SECONDS', '2.0'))

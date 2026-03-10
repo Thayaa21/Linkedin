@@ -32,8 +32,6 @@ from config import (
     POLL_INTERVAL_HOURS,
     SEND_HOUR,
     MESSAGE_TEMPLATE,
-    ENRICH_MAX_CONNECTIONS,
-    ENRICH_DELAY_SECONDS,
 )
 
 logging.basicConfig(
@@ -91,31 +89,6 @@ async def poll_connections():
             logger.info(
                 "Headline extraction filled company for %d connections", headline_filled
             )
-
-            # ── Pass 1b: enrich from work experience API when headline has no company ─
-            # LinkedIn headlines can be vague ("Software Engineer", "AI Enthusiast").
-            # Call the profile/positions API to get current employer from experience.
-            to_enrich = [
-                conn for conn in current.values()
-                if not conn.get("current_company")
-            ][:ENRICH_MAX_CONNECTIONS]
-            if to_enrich:
-                csrf_token = await li.get_csrf_token(page)
-                enriched = 0
-                for conn in to_enrich:
-                    url = conn.get("url", "")
-                    if not url or "/in/" not in url:
-                        continue
-                    public_id = url.rstrip("/").split("/")[-1]
-                    if not public_id:
-                        continue
-                    company = await li.get_profile_company(page, public_id, csrf_token)
-                    if company:
-                        conn["current_company"] = company
-                        enriched += 1
-                        logger.info("Enriched %s → company: %s", conn["name"], company)
-                    await asyncio.sleep(ENRICH_DELAY_SECONDS)
-                logger.info("Experience API enriched %d connections (no company in headline)", enriched)
 
             # ── Load snapshot from Google Sheets (persists across GH Actions runs) ──
             old_snapshot = sheets.load_snapshot_from_sheet()

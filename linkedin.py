@@ -543,6 +543,22 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
         await page.goto(profile_url, wait_until="domcontentloaded")
         await _pause(2, 4)
 
+        # Dismiss overlays that block the Message button (cookie banner, prompts, etc.)
+        for selector in [
+            "button[aria-label='Dismiss']",
+            "button:has-text('Accept'), button:has-text('Accept all')",
+            "[data-test-modal-close-btn]",
+            ".artdeco-modal__dismiss",
+        ]:
+            try:
+                dismiss = await page.query_selector(selector)
+                if dismiss:
+                    await dismiss.click(timeout=2000)
+                    await _pause(0.5, 1)
+                    break
+            except Exception:
+                pass
+
         # Click the "Message" button on the profile
         msg_btn = await page.query_selector(
             "button:has-text('Message'), "
@@ -553,7 +569,8 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             logger.warning("No Message button found on %s", profile_url)
             return False
 
-        await msg_btn.click()
+        # Use force=True to bypass overlays that intercept pointer events
+        await msg_btn.click(force=True)
         await _pause(1.5, 3)
 
         # Type message in the composer
@@ -566,7 +583,7 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             logger.warning("Message composer not found for %s", profile_url)
             return False
 
-        await composer.click()
+        await composer.click(force=True)
         await _pause(0.5, 1)
 
         # Type naturally (character by character with small delays)
@@ -583,7 +600,7 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             logger.warning("Send button not found for %s", profile_url)
             return False
 
-        await send_btn.click()
+        await send_btn.click(force=True)
         await _pause(2, 3)
         logger.info("Message sent to %s", profile_url)
         return True
