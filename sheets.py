@@ -18,14 +18,15 @@ SCOPES = [
 ]
 
 # Column indices (0-based)
-COL_TIMESTAMP = 0
-COL_COMPANY   = 1
-COL_ROLE      = 2
-COL_URL       = 3
-COL_STATUS    = 4
-COL_SOURCE    = 5
-COL_LI_NAME   = 6   # added by agent when a match is found
-COL_LI_URL    = 7   # LinkedIn profile URL of matched connection
+COL_TIMESTAMP   = 0
+COL_COMPANY     = 1
+COL_ROLE        = 2
+COL_URL         = 3
+COL_STATUS      = 4
+COL_SOURCE      = 5
+COL_LI_NAME     = 6   # added by agent when a match is found
+COL_LI_URL      = 7   # LinkedIn profile URL of matched connection
+COL_RESUME_LINK = 8   # Google Drive resume link (populated by poll)
 
 STATUS_APPLIED          = "Applied"
 STATUS_PENDING          = "Pending Message"
@@ -48,7 +49,7 @@ def _worksheet():
 def get_applied_companies() -> list[dict]:
     """
     Returns all rows with Status == 'Applied'.
-    Each dict has keys: row_index, company, role, url, timestamp
+    Each dict has keys: row_index, company, role, url, timestamp, resume_link
     (row_index is 1-based, accounting for the header row)
     """
     ws = _worksheet()
@@ -60,11 +61,12 @@ def get_applied_companies() -> list[dict]:
         status = row[COL_STATUS].strip()
         if status == STATUS_APPLIED:
             results.append({
-                "row_index": i,
-                "company":   row[COL_COMPANY].strip(),
-                "role":      row[COL_ROLE].strip(),
-                "url":       row[COL_URL].strip(),
-                "timestamp": row[COL_TIMESTAMP].strip(),
+                "row_index":   i,
+                "company":     row[COL_COMPANY].strip(),
+                "role":        row[COL_ROLE].strip(),
+                "url":         row[COL_URL].strip(),
+                "timestamp":   row[COL_TIMESTAMP].strip(),
+                "resume_link": row[COL_RESUME_LINK].strip() if len(row) > COL_RESUME_LINK else "",
             })
     return results
 
@@ -84,11 +86,18 @@ def get_pending_rows() -> list[dict]:
                 "role":        row[COL_ROLE].strip(),
                 "li_name":     row[COL_LI_NAME].strip() if len(row) > COL_LI_NAME else "",
                 "li_url":      row[COL_LI_URL].strip()  if len(row) > COL_LI_URL  else "",
+                "resume_link": row[COL_RESUME_LINK].strip() if len(row) > COL_RESUME_LINK else "",
             })
     return results
 
 
 # ─── Write ────────────────────────────────────────────────────────────────────
+
+def store_resume_link(row_index: int, link: str):
+    """Store the Drive resume link in column I for a given row."""
+    ws = _worksheet()
+    ws.update_cell(row_index, COL_RESUME_LINK + 1, link)
+
 
 def mark_pending(row_index: int, li_name: str, li_url: str):
     """Connection accepted — mark row as Pending Message + store LinkedIn info."""

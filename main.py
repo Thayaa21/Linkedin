@@ -109,6 +109,21 @@ async def poll_connections():
         finally:
             await browser.close()
 
+    # After LinkedIn scraping, fetch & store resume links for Applied rows
+    # that don't have one yet. This runs every poll cycle so the user has
+    # time to upload the resume after applying (well before the next poll).
+    logger.info("Checking resume links for Applied rows...")
+    applied_rows = sheets.get_applied_companies()
+    for row in applied_rows:
+        if row["resume_link"]:
+            continue  # already stored, skip
+        link = drive.get_resume_link(row["company"])
+        if link:
+            sheets.store_resume_link(row["row_index"], link)
+            logger.info("Stored resume link for %s → row %d", row["company"], row["row_index"])
+        else:
+            logger.info("No resume yet for %s (row %d)", row["company"], row["row_index"])
+
     logger.info("=== poll_connections complete ===")
 
 
@@ -154,8 +169,11 @@ async def send_messages():
                 li_name     = row["li_name"]
                 first_name  = li_name.split()[0] if li_name else "there"
 
-                # Step 5: fetch resume link from Drive
-                resume_link = drive.get_resume_link(company)
+                # Step 5: get resume link from sheet (stored during poll)
+                resume_link = row.get("resume_link", "")
+                if not resume_link:
+                    # Fallback: try Drive directly in case poll missed it
+                    resume_link = drive.get_resume_link(company)
                 if not resume_link:
                     logger.warning("No resume for %s — skipping DM, marking No Resume", company)
                     sheets.mark_no_resume(row["row_index"])
