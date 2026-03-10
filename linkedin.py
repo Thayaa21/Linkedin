@@ -80,6 +80,19 @@ async def get_connections(page: Page) -> dict[str, dict]:
     await page.goto(CONNECTIONS_URL, wait_until="domcontentloaded")
     await _pause(3, 5)
 
+    # Debug: log page title and URL to confirm we landed on the right page
+    title = await page.title()
+    logger.info("Page title: %s | URL: %s", title, page.url)
+
+    # Debug: try to find the connection count header LinkedIn shows (e.g. "1,234 connections")
+    count_el = await page.query_selector("h1")
+    if count_el:
+        logger.info("Page h1: %s", (await count_el.inner_text()).strip())
+
+    # Debug: count total <li> elements on the page as a sanity check
+    all_li = await page.query_selector_all("li")
+    logger.info("Total <li> elements on page: %d", len(all_li))
+
     connections: dict[str, dict] = {}
     prev_count = -1
 
