@@ -71,32 +71,55 @@ async def poll_connections():
             # Scrape current connections
             current = await li.get_connections(page)
 
+            # ── Pass 1: headline extraction (free, no API) ────────────────────
+            # Many connections show their employer in the headline ("at X", "@ X").
+            # Extract it and store it as current_company right away.
+            # This also backfills the existing 51 that were saved with empty company.
+            headline_filled = 0
+            for conn in current.values():
+                if conn.get("current_company"):
+                    continue  # already have it
+                headline = conn.get("headline", "")
+                extracted = m.extract_company_from_headline(headline)
+                # Only store if we actually extracted something distinct from the
+                # full headline (i.e., there was an "at/@ X" pattern)
+                if extracted and extracted != headline.strip():
+                    conn["current_company"] = extracted
+                    headline_filled += 1
+            logger.info(
+                "Headline extraction filled company for %d connections", headline_filled
+            )
+
             # ── Load snapshot from Google Sheets (persists across GH Actions runs) ──
             old_snapshot = sheets.load_snapshot_from_sheet()
             logger.info("Snapshot loaded: %d previously seen connections", len(old_snapshot))
 
+            # Carry forward any company that was already enriched in the snapshot
+            # (survives re-scrapes where the batch API again returns empty company)
+            for url, snap_conn in old_snapshot.items():
+                if url in current and not current[url].get("current_company"):
+                    stored = snap_conn.get("current_company", "")
+                    if stored:
+                        current[url]["current_company"] = stored
+
             new_connections = li.diff_connections(old_snapshot, current)
             logger.info("New connections since last poll: %d", len(new_connections))
+
+            # Get CSRF token once — reuse for new connection enrichment + backfill
+            csrf_token = await li.get_csrf_token(page)
 
             if new_connections:
                 # Load sheet rows that are still in "Applied" state
                 applied_rows = sheets.get_applied_companies()
                 logger.info("Applied rows in sheet: %d", len(applied_rows))
 
-                # Get CSRF token once — reuse for all profile lookups
-                csrf_token = await li.get_csrf_token(page)
-
                 for conn in new_connections:
                     headline        = conn.get("headline", "")
                     current_company = conn.get("current_company", "")
                     company_hint    = m.extract_company_from_headline(headline)
 
-                    # ── Enrich via profile API if we don't already have a company ──
-                    # Call profile API whenever current_company is empty AND we have
-                    # a CSRF token.  We no longer skip based on headline_matched —
-                    # we always want the real employer in the snapshot.
-                    need_enrich = not current_company and bool(csrf_token)
-                    if need_enrich:
+                    # ── Enrich via profile API if still no company ────────────
+                    if not current_company and csrf_token:
                         pub_id = conn["url"].split("/in/")[-1].rstrip("/")
                         logger.info("  Enriching %s (pub_id=%s)…", conn["name"], pub_id)
                         fetched = await li.get_profile_company(page, pub_id, csrf_token)
@@ -109,7 +132,6 @@ async def poll_connections():
                             )
                         else:
                             logger.info("  No company found for %s after enrichment", conn["name"])
-                        # Small pause so we don't hammer the LinkedIn API
                         await asyncio.sleep(0.8)
 
                     logger.info(
@@ -141,6 +163,79 @@ async def poll_connections():
                         )
                     else:
                         logger.info("No sheet match for connection: %s", conn["name"])
+
+            # ── Pass 2: API backfill for connections still missing a company ──
+            # Runs every poll so the snapshot gradually fills up.
+            # Capped at 15 API calls per cycle to avoid rate-limiting LinkedIn.
+            still_empty = [
+                conn for conn in current.values()
+                if not conn.get("current_company")
+            ]
+            if still_empty and csrf_token:
+                cap = 15
+                logger.info(
+                    "API backfill: %d connections still have no company (will enrich up to %d)",
+                    len(still_empty), cap,
+                )
+                enriched = 0
+                for conn in still_empty:
+                    if enriched >= cap:
+                        break
+                    pub_id = conn["url"].split("/in/")[-1].rstrip("/")
+                    fetched = await li.get_profile_company(page, pub_id, csrf_token)
+                    if fetched:
+                        conn["current_company"] = fetched
+                        logger.info("  Backfilled %s → '%s'", conn["name"], fetched)
+                        enriched += 1
+                    await asyncio.sleep(0.8)
+                logger.info("API backfill complete: filled %d companies", enriched)
+
+            # ── Pass 3: Multi-referral — message ALL connections at target companies ─
+            # We check EVERY connection in the snapshot (not just new ones) against
+            # ALL jobs we've applied to (any status).  Anyone whose company matches
+            # but who hasn't been tracked in the sheet yet gets a new Pending row.
+            # This means if we have 3 Nokia connections, all 3 get messaged,
+            # regardless of when they accepted.
+            all_jobs     = sheets.get_all_jobs()
+            tracked_urls = sheets.get_tracked_li_urls()  # loaded AFTER mark_pending above
+            new_referrals = 0
+
+            if all_jobs:
+                for conn in current.values():
+                    li_url = conn["url"]
+                    if li_url in tracked_urls:
+                        continue  # already pending, sent, or otherwise tracked
+
+                    company      = conn.get("current_company", "")
+                    company_hint = m.extract_company_from_headline(conn.get("headline", ""))
+
+                    # Try company first, then headline hint
+                    matched = None
+                    if company:
+                        matched = m.find_matching_row(company, all_jobs)
+                    if not matched and company_hint and company_hint != conn.get("headline", "").strip():
+                        matched = m.find_matching_row(company_hint, all_jobs)
+
+                    if matched:
+                        logger.info(
+                            "Multi-referral: %s → %s @ %s (job status: %s)",
+                            conn["name"], matched["role"], matched["company"],
+                            matched.get("status", "?"),
+                        )
+                        sheets.add_pending_row(
+                            timestamp=matched.get("timestamp", ""),
+                            company=matched["company"],
+                            role=matched["role"],
+                            job_url=matched.get("url", ""),
+                            source=matched.get("source", ""),
+                            li_name=conn["name"],
+                            li_url=li_url,
+                        )
+                        tracked_urls.add(li_url)  # prevent duplicate within this poll
+                        new_referrals += 1
+
+            if new_referrals:
+                logger.info("Multi-referral: added %d new pending rows", new_referrals)
 
             # ── Save snapshot back to Sheets so next run only sees truly new ones ──
             sheets.save_snapshot_to_sheet(current)

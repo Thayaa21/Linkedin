@@ -72,6 +72,81 @@ def get_applied_companies() -> list[dict]:
     return results
 
 
+def get_all_jobs() -> list[dict]:
+    """
+    Returns ALL rows that have a job URL — regardless of status.
+    Used for multi-referral matching: even if we already sent to one person
+    at Nokia, we still want to match and message a second Nokia connection.
+    """
+    ws = _worksheet()
+    records = ws.get_all_values()
+    results = []
+    for i, row in enumerate(records[1:], start=2):
+        if len(row) < 5:
+            continue
+        job_url = row[COL_URL].strip() if len(row) > COL_URL else ""
+        if not job_url:
+            continue  # rows added by add_pending_row have no job URL — skip
+        results.append({
+            "row_index":   i,
+            "company":     row[COL_COMPANY].strip(),
+            "role":        row[COL_ROLE].strip(),
+            "url":         job_url,
+            "status":      row[COL_STATUS].strip(),
+            "timestamp":   row[COL_TIMESTAMP].strip(),
+            "source":      row[COL_SOURCE].strip() if len(row) > COL_SOURCE else "",
+            "resume_link": row[COL_RESUME_LINK].strip() if len(row) > COL_RESUME_LINK else "",
+        })
+    return results
+
+
+def get_tracked_li_urls() -> set[str]:
+    """
+    Returns the set of ALL LinkedIn profile URLs already in the sheet
+    (any status: Pending, Sent, No Resume, etc.).
+
+    Used to avoid creating duplicate pending entries for someone we're
+    already planning to message — or have already messaged.
+    """
+    ws = _worksheet()
+    records = ws.get_all_values()
+    urls: set[str] = set()
+    for row in records[1:]:
+        if len(row) > COL_LI_URL:
+            url = row[COL_LI_URL].strip()
+            if url:
+                urls.add(url)
+    return urls
+
+
+def add_pending_row(
+    timestamp: str,
+    company: str,
+    role: str,
+    job_url: str,
+    source: str,
+    li_name: str,
+    li_url: str,
+):
+    """
+    Appends a NEW 'Pending Message' row for an additional connection at a
+    company we've already applied to.  The original application row is left
+    unchanged — this is a second (or third…) referral request for the same job.
+    """
+    ws = _worksheet()
+    ws.append_row([
+        timestamp,    # A — reuse original application timestamp
+        company,      # B
+        role,         # C
+        job_url,      # D — keep the job URL so resume lookup works
+        STATUS_PENDING,  # E
+        source,       # F
+        li_name,      # G
+        li_url,       # H
+        "",           # I — resume_link filled later by poll
+    ])
+
+
 def get_pending_rows() -> list[dict]:
     """Returns rows with Status == 'Pending Message' (ready to send DM)."""
     ws = _worksheet()
