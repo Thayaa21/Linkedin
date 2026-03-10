@@ -105,9 +105,6 @@ async def poll_connections():
             new_connections = li.diff_connections(old_snapshot, current)
             logger.info("New connections since last poll: %d", len(new_connections))
 
-            # Get CSRF token once — reuse for new connection enrichment + backfill
-            csrf_token = await li.get_csrf_token(page)
-
             if new_connections:
                 # Load sheet rows that are still in "Applied" state
                 applied_rows = sheets.get_applied_companies()
@@ -117,22 +114,6 @@ async def poll_connections():
                     headline        = conn.get("headline", "")
                     current_company = conn.get("current_company", "")
                     company_hint    = m.extract_company_from_headline(headline)
-
-                    # ── Enrich via profile API if still no company ────────────
-                    if not current_company and csrf_token:
-                        pub_id = conn["url"].split("/in/")[-1].rstrip("/")
-                        logger.info("  Enriching %s (pub_id=%s)…", conn["name"], pub_id)
-                        fetched = await li.get_profile_company(page, pub_id, csrf_token)
-                        if fetched:
-                            current_company = fetched
-                            conn["current_company"] = fetched
-                            logger.info(
-                                "  Enriched %s → work-exp company: '%s'",
-                                conn["name"], current_company,
-                            )
-                        else:
-                            logger.info("  No company found for %s after enrichment", conn["name"])
-                        await asyncio.sleep(0.8)
 
                     logger.info(
                         "New connection: %s | headline: '%s' | extracted: '%s' | company: '%s'",
@@ -164,31 +145,20 @@ async def poll_connections():
                     else:
                         logger.info("No sheet match for connection: %s", conn["name"])
 
-            # ── Pass 2: API backfill for connections still missing a company ──
-            # Runs every poll so the snapshot gradually fills up.
-            # Capped at 15 API calls per cycle to avoid rate-limiting LinkedIn.
+            # ── Pass 2: log connections still missing a company ───────────────
+            # LinkedIn's Voyager profile API returns 410 Gone (deprecated).
+            # These connections have vague headlines ("AI/ML Engineer", "--") or
+            # private profiles — their company isn't discoverable without manually
+            # visiting each profile page, so we leave them as "".
             still_empty = [
-                conn for conn in current.values()
+                conn["name"] for conn in current.values()
                 if not conn.get("current_company")
             ]
-            if still_empty and csrf_token:
-                cap = 15
+            if still_empty:
                 logger.info(
-                    "API backfill: %d connections still have no company (will enrich up to %d)",
-                    len(still_empty), cap,
+                    "%d connections have no company (vague headline / private): %s",
+                    len(still_empty), ", ".join(still_empty),
                 )
-                enriched = 0
-                for conn in still_empty:
-                    if enriched >= cap:
-                        break
-                    pub_id = conn["url"].split("/in/")[-1].rstrip("/")
-                    fetched = await li.get_profile_company(page, pub_id, csrf_token)
-                    if fetched:
-                        conn["current_company"] = fetched
-                        logger.info("  Backfilled %s → '%s'", conn["name"], fetched)
-                        enriched += 1
-                    await asyncio.sleep(0.8)
-                logger.info("API backfill complete: filled %d companies", enriched)
 
             # ── Pass 3: Multi-referral — message ALL connections at target companies ─
             # We check EVERY connection in the snapshot (not just new ones) against

@@ -17,9 +17,12 @@ from config import FUZZY_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
-# Patterns to extract "Company" from a LinkedIn headline
+# Patterns to extract "Company" from a LinkedIn headline.
+# Two sub-patterns:
+#   1. "at " — word separator, MUST have whitespace after (avoids matching "database")
+#   2. @  –  —  |  -  — symbol separators, space is OPTIONAL (handles "@Company" no-space)
 _AT_PATTERN = re.compile(
-    r'(?:at|@|–|—|-|\|)\s+(.+?)(?:\s*[,|]|\s*$)',
+    r'(?:at\s+|[@–—|]\s*|(?<!\w)-\s+)(.+?)(?:\s*[,|]|\s*$)',
     re.IGNORECASE
 )
 
