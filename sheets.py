@@ -147,6 +147,32 @@ def add_pending_row(
     ])
 
 
+def get_rows_needing_resume() -> list[dict]:
+    """
+    Returns all rows (Applied or Pending) that need a resume link from Drive.
+    Used by poll to fetch and store resume links in the sheet.
+    """
+    ws = _worksheet()
+    records = ws.get_all_values()
+    results = []
+    for i, row in enumerate(records[1:], start=2):
+        if len(row) < 5:
+            continue
+        status = row[COL_STATUS].strip()
+        if status not in (STATUS_APPLIED, STATUS_PENDING):
+            continue
+        resume = row[COL_RESUME_LINK].strip() if len(row) > COL_RESUME_LINK else ""
+        if resume:
+            continue  # already has resume
+        results.append({
+            "row_index":   i,
+            "company":     row[COL_COMPANY].strip(),
+            "role":        row[COL_ROLE].strip(),
+            "status":      status,
+        })
+    return results
+
+
 def get_pending_rows() -> list[dict]:
     """Returns rows with Status == 'Pending Message' (ready to send DM)."""
     ws = _worksheet()

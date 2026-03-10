@@ -540,8 +540,23 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
     """
     logger.info("Sending DM to %s", profile_url)
     try:
+        # Longer timeout for typing long messages (default 30s can be too short)
+        page.set_default_timeout(60000)
         await page.goto(profile_url, wait_until="domcontentloaded")
         await _pause(2, 4)
+
+        # Disable hidden interop iframe that intercepts clicks (opacity:0, full viewport)
+        # Without this, clicks hit the iframe instead of Message button → goes to Learning
+        await page.evaluate("""
+            () => {
+                const iframe = document.querySelector('[data-testid="interop-iframe"]');
+                if (iframe) {
+                    iframe.style.pointerEvents = 'none';
+                    iframe.style.visibility = 'hidden';
+                }
+            }
+        """)
+        await _pause(0.5, 1)
 
         # Dismiss overlays that block the Message button (cookie banner, prompts, etc.)
         for selector in [
@@ -559,26 +574,66 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             except Exception:
                 pass
 
-        # Click the "Message" button on the profile
-        msg_btn = await page.query_selector(
-            "button:has-text('Message'), "
-            "a:has-text('Message'), "
-            "[aria-label*='Message']"
-        )
+        # Click the "Message" button — scoped to profile main (data-sdui-screen="...Profile")
+        # Hidden iframe was intercepting clicks; we disabled it above
+        msg_btn = None
+        for sel in [
+            '[data-sdui-screen="com.linkedin.sdui.flagshipnav.profile.Profile"] button:has-text("Message")',
+            '[data-sdui-screen="com.linkedin.sdui.flagshipnav.profile.Profile"] a:has-text("Message")',
+            "div.pv-top-card a.message-anywhere-button",
+            "div.pv-top-card-v2-ctas a:has-text('Message')",
+            ".pv-top-card button:has-text('Message')",
+            ".pv-top-card a:has-text('Message')",
+        ]:
+            try:
+                msg_btn = await page.query_selector(sel)
+                if msg_btn:
+                    href = await msg_btn.get_attribute("href") or ""
+                    if "learning" in href.lower():
+                        msg_btn = None
+                        continue
+                    break
+            except Exception:
+                continue
+
+        if not msg_btn:
+            msg_btn = await page.query_selector("button:has-text('Message'):not([href*='learning']), a:has-text('Message'):not([href*='learning'])")
         if not msg_btn:
             logger.warning("No Message button found on %s", profile_url)
             return False
 
-        # Use force=True to bypass overlays that intercept pointer events
-        await msg_btn.click(force=True)
-        await _pause(1.5, 3)
+        # Use JS click to bypass any remaining overlay issues
+        await msg_btn.evaluate("el => el.click()")
+        await _pause(3, 5)  # Panel animates in — wait for it
+
+        # Disable iframe again (panel may have re-rendered it)
+        await page.evaluate("""
+            () => {
+                const iframe = document.querySelector('[data-testid="interop-iframe"]');
+                if (iframe) { iframe.style.pointerEvents = 'none'; iframe.style.visibility = 'hidden'; }
+            }
+        """)
 
         # Type message in the composer
-        composer = await page.query_selector(
-            ".msg-form__contenteditable, "
-            "[data-artdeco-is-focused='true'] [contenteditable='true'], "
-            "[role='textbox']"
-        )
+        composer = None
+        for sel in [
+            ".msg-form__contenteditable",
+            ".msg-form [contenteditable='true']",
+            "[data-placeholder='Write a message']",
+            "[placeholder='Write a message']",
+            "[data-placeholder*='Write']",
+            "[placeholder*='message']",
+            ".msg-overlay-conversation-bubble [contenteditable='true']",
+            "div[contenteditable='true'][aria-label]",
+            "[role='textbox']",
+        ]:
+            try:
+                composer = await page.wait_for_selector(sel, timeout=3000)
+                if composer:
+                    break
+            except Exception:
+                continue
+
         if not composer:
             logger.warning("Message composer not found for %s", profile_url)
             return False
@@ -586,8 +641,19 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
         await composer.click(force=True)
         await _pause(0.5, 1)
 
-        # Type naturally (character by character with small delays)
-        await composer.type(message, delay=random.randint(30, 80))
+        # Type message — use JS insertText as fallback (works with contenteditable + iframe)
+        try:
+            await composer.type(message, delay=15)
+        except Exception:
+            # Fallback: JS for contenteditable (bypasses iframe/focus issues)
+            await composer.evaluate(
+                """(el, msg) => {
+                    el.focus();
+                    el.innerText = msg;
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+                }""",
+                message,
+            )
         await _pause(1, 2)
 
         # Click Send
@@ -613,7 +679,7 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
 # ─── Browser factory (used by main.py) ───────────────────────────────────────
 
 async def make_browser_context(playwright):
-    """Creates a headless browser context with a realistic user agent."""
+    """Creates a headless browser context."""
     browser = await playwright.chromium.launch(
         headless=True,
         args=["--disable-blink-features=AutomationControlled"],

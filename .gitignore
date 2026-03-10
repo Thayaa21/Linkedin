@@ -5,3 +5,4 @@ venv/
 google_creds.json
 linkedin_cookies.json
 connections_snapshot.json
+send_debug_screenshot.png
