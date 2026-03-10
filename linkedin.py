@@ -95,55 +95,110 @@ async def get_connections(page: Page) -> dict[str, dict]:
         return {}
 
     # Call LinkedIn's internal Voyager API for 50 most recently added connections.
-    # This is more reliable than HTML scraping in headless/CI environments.
+    # We try two endpoints and two Accept headers (plain JSON is easier to parse).
     logger.info("Calling LinkedIn Voyager API for connections...")
-    data = await page.evaluate("""
+    result = await page.evaluate("""
         async (csrfToken) => {
-            const endpoints = [
-                '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
-                '/voyager/api/relationships/connections?count=50&q=search&sortType=RECENTLY_ADDED&networkType=F',
+            // Attempt 1: dash endpoint, plain JSON (no normalization)
+            // Attempt 2: dash endpoint, normalized JSON
+            // Attempt 3: legacy endpoint, plain JSON
+            const attempts = [
+                {
+                    url: '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
+                    accept: 'application/json',
+                },
+                {
+                    url: '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
+                    accept: 'application/vnd.linkedin.normalized+json+2.1',
+                },
+                {
+                    url: '/voyager/api/relationships/connections?count=50&q=search&sortType=RECENTLY_ADDED&networkType=F',
+                    accept: 'application/json',
+                },
             ];
-            for (const url of endpoints) {
+            for (const attempt of attempts) {
                 try {
-                    const resp = await fetch(url, {
+                    const resp = await fetch(attempt.url, {
                         headers: {
-                            'Accept': 'application/vnd.linkedin.normalized+json+2.1',
+                            'Accept': attempt.accept,
                             'csrf-token': csrfToken,
-                            'x-restli-protocol-version': '2.0.0'
+                            'x-restli-protocol-version': '2.0.0',
+                            'x-li-lang': 'en_US',
                         },
                         credentials: 'include'
                     });
                     const body = await resp.text();
+                    // Always log the first 600 chars so we can see the shape
+                    console.log('API ' + attempt.url.split('?')[0] +
+                                ' accept=' + attempt.accept.split('/').pop() +
+                                ' status=' + resp.status +
+                                ' preview=' + body.slice(0, 600));
                     if (!resp.ok) {
-                        console.log('API failed ' + url + ' status=' + resp.status + ' body=' + body.slice(0, 200));
                         continue;
                     }
-                    return JSON.parse(body);
+                    const parsed = JSON.parse(body);
+                    return { ok: true, accept: attempt.accept, parsed: parsed };
                 } catch(e) {
-                    console.log('API exception ' + url + ': ' + e.message);
+                    console.log('API exception ' + attempt.url + ': ' + e.message);
                 }
             }
-            return { error: 'all endpoints failed' };
+            return { ok: false, error: 'all endpoints failed' };
         }
     """, csrf_token)
 
-    if not data or "error" in data:
-        logger.error("Voyager API failed: %s", data.get("error") if data else "null")
+    if not result or not result.get("ok"):
+        logger.error("Voyager API failed: %s", result.get("error") if result else "null")
         return {}
 
-    elements = data.get("elements", [])
-    logger.info("API returned %d connection elements", len(elements))
+    accept_used = result.get("accept", "")
+    data = result.get("parsed", {})
+    top_keys = list(data.keys()) if isinstance(data, dict) else []
+    logger.info("API response top-level keys: %s (accept=%s)", top_keys, accept_used)
+
+    # ── Parse plain-JSON response  (elements[] at top level) ──────────────────
+    raw_elements = data.get("elements", [])
+
+    # ── Parse normalized-JSON response (included[] at top level) ──────────────
+    # In normalized format the connection objects sit in `included` alongside
+    # profile objects; we pick only Connection-typed entries.
+    if not raw_elements:
+        included = data.get("included", [])
+        logger.info("Plain JSON elements=0, trying included[] (%d items)", len(included))
+        raw_elements = [
+            item for item in included
+            if isinstance(item, dict)
+            and "connection" in item.get("$type", "").lower()
+        ]
+        if not raw_elements:
+            # Last resort: grab *all* Profile objects from included
+            raw_elements = [
+                item for item in included
+                if isinstance(item, dict)
+                and "profile" in item.get("$type", "").lower()
+                and item.get("publicIdentifier")
+            ]
+            logger.info("Connection objects=0, falling back to Profile objects: %d", len(raw_elements))
+
+    logger.info("API returned %d connection elements to parse", len(raw_elements))
 
     connections: dict[str, dict] = {}
-    for element in elements:
+    for element in raw_elements:
         try:
-            profile = element.get("connectedMemberResolutionResult", {})
+            # Plain-JSON dash endpoint wraps the profile under this key
+            profile = element.get("connectedMemberResolutionResult") or {}
+
+            # Normalized / profile-object fallback: the element itself IS the profile
+            if not profile and element.get("publicIdentifier"):
+                profile = element
+
             if not profile:
                 continue
+
             name = f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip()
             identifier = profile.get("publicIdentifier", "")
             if not identifier:
                 continue
+
             url = f"{LINKEDIN_BASE}/in/{identifier}"
             headline_raw = profile.get("headline", "")
             headline = headline_raw if isinstance(headline_raw, str) else ""
