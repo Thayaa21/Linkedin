@@ -312,38 +312,76 @@ async def get_csrf_token(page: Page) -> str:
 
 async def get_profile_company(page: Page, public_identifier: str, csrf_token: str) -> str:
     """
-    Calls the Voyager profile endpoint for one person and returns their
-    current employer extracted from their Experience/Positions data.
-
-    Used as a fallback when the headline doesn't mention a company name.
+    Fetches the person's current employer from their LinkedIn work experience.
+    Tries three endpoints in order — stops at the first that returns data.
     Returns "" on any error or if no position data is found.
     """
     result = await page.evaluate("""
         async ([publicId, csrfToken]) => {
-            try {
-                const resp = await fetch('/voyager/api/identity/profiles/' + publicId, {
-                    headers: {
-                        'Accept': 'application/vnd.linkedin.normalized+json+2.1',
-                        'csrf-token': csrfToken,
-                        'x-restli-protocol-version': '2.0.0',
-                    },
-                    credentials: 'include',
-                });
-                if (!resp.ok) return '';
-                const data = JSON.parse(await resp.text());
-                const included = data.included || [];
+            const headers = {
+                'Accept': 'application/vnd.linkedin.normalized+json+2.1',
+                'csrf-token': csrfToken,
+                'x-restli-protocol-version': '2.0.0',
+            };
 
-                // Prefer current positions (no timePeriod.endDate)
+            function extractCompany(included) {
+                if (!Array.isArray(included)) return '';
                 const positions = included.filter(e =>
                     e.$type && e.$type.toLowerCase().includes('position')
                 );
+                // Prefer current position (no end date)
                 const current = positions.find(p => !p.timePeriod?.endDate);
                 const best = current || positions[0];
                 if (!best) return '';
-                return best.companyName || (best.company && best.company.name) || '';
-            } catch (e) {
-                return '';
+                return best.companyName
+                    || (best.company && best.company.name)
+                    || '';
             }
+
+            // Attempt 1: dedicated positions endpoint (most direct)
+            try {
+                const r = await fetch(
+                    '/voyager/api/identity/profiles/' + publicId + '/positions',
+                    { headers, credentials: 'include' }
+                );
+                if (r.ok) {
+                    const d = JSON.parse(await r.text());
+                    const company = extractCompany(d.included || [])
+                        || extractCompany(d.elements || []);
+                    if (company) return company;
+                }
+            } catch(e) {}
+
+            // Attempt 2: full profile with explicit projection for positions
+            try {
+                const r = await fetch(
+                    '/voyager/api/identity/profiles/' + publicId +
+                    '?projection=(positions)',
+                    { headers, credentials: 'include' }
+                );
+                if (r.ok) {
+                    const d = JSON.parse(await r.text());
+                    const company = extractCompany(d.included || []);
+                    if (company) return company;
+                }
+            } catch(e) {}
+
+            // Attempt 3: dash profile endpoint
+            try {
+                const r = await fetch(
+                    '/voyager/api/identity/dash/profiles/' +
+                    encodeURIComponent('urn:li:fsd_profile:' + publicId) +
+                    '?projection=(profileView,positions)',
+                    { headers, credentials: 'include' }
+                );
+                if (r.ok) {
+                    const d = JSON.parse(await r.text());
+                    const company = extractCompany(d.included || []);
+                    if (company) return company;
+                }
+            } catch(e) {}
+
+            return '';
         }
     """, [public_identifier, csrf_token])
     return result or ""

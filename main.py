@@ -91,18 +91,21 @@ async def poll_connections():
                     current_company = conn.get("current_company", "")
                     company_hint    = m.extract_company_from_headline(headline)
 
-                    # ── Enrich: if headline extraction looks weak, fetch profile ──
-                    # The profile Voyager API returns real work-experience company names.
-                    # We only call it when the headline didn't give us a clean company,
-                    # keeping API calls minimal.
-                    if not current_company and csrf_token:
+                    # ── Enrich via profile API if headline didn't yield a match ──
+                    # Only call the profile API when:
+                    #   a) we have no current_company from the scrape, AND
+                    #   b) the headline extraction didn't produce a clean company
+                    #      (i.e. it's empty, or it still has no match in the sheet)
+                    headline_matched = bool(m.find_matching_row(company_hint, applied_rows))
+                    need_enrich = not current_company and not headline_matched and csrf_token
+                    if need_enrich:
                         pub_id = conn["url"].split("/in/")[-1].rstrip("/")
                         fetched = await li.get_profile_company(page, pub_id, csrf_token)
                         if fetched:
                             current_company = fetched
                             conn["current_company"] = fetched
                             logger.info(
-                                "  Enriched %s → company from profile: '%s'",
+                                "  Enriched %s → work-exp company: '%s'",
                                 conn["name"], current_company,
                             )
 
