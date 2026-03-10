@@ -78,6 +78,7 @@ async def get_connections(page: Page) -> dict[str, dict]:
     """
     # Navigate to LinkedIn home to establish session (not connections page directly)
     logger.info("Navigating to LinkedIn to establish session...")
+    page.on("console", lambda msg: logger.info("BROWSER: %s", msg.text) if msg.type == "log" else None)
     await page.goto(f"{LINKEDIN_BASE}/mynetwork/", wait_until="domcontentloaded")
     await _pause(2, 4)
 
@@ -98,23 +99,31 @@ async def get_connections(page: Page) -> dict[str, dict]:
     logger.info("Calling LinkedIn Voyager API for connections...")
     data = await page.evaluate("""
         async (csrfToken) => {
-            const url = '/voyager/api/relationships/dash/connections'
-                + '?decorationId=com.linkedin.voyager.dash.deco.web.mynetwork.ConnectionListWithDistance-5'
-                + '&count=50&q=search&sortType=RECENTLY_ADDED';
-            try {
-                const resp = await fetch(url, {
-                    headers: {
-                        'Accept': 'application/vnd.linkedin.normalized+json+2.1',
-                        'csrf-token': csrfToken,
-                        'x-restli-protocol-version': '2.0.0'
-                    },
-                    credentials: 'include'
-                });
-                if (!resp.ok) return { error: resp.status + ' ' + resp.statusText };
-                return await resp.json();
-            } catch(e) {
-                return { error: e.message };
+            const endpoints = [
+                '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
+                '/voyager/api/relationships/connections?count=50&q=search&sortType=RECENTLY_ADDED&networkType=F',
+            ];
+            for (const url of endpoints) {
+                try {
+                    const resp = await fetch(url, {
+                        headers: {
+                            'Accept': 'application/vnd.linkedin.normalized+json+2.1',
+                            'csrf-token': csrfToken,
+                            'x-restli-protocol-version': '2.0.0'
+                        },
+                        credentials: 'include'
+                    });
+                    const body = await resp.text();
+                    if (!resp.ok) {
+                        console.log('API failed ' + url + ' status=' + resp.status + ' body=' + body.slice(0, 200));
+                        continue;
+                    }
+                    return JSON.parse(body);
+                } catch(e) {
+                    console.log('API exception ' + url + ': ' + e.message);
+                }
             }
+            return { error: 'all endpoints failed' };
         }
     """, csrf_token)
 
