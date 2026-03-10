@@ -76,81 +76,72 @@ async def get_connections(page: Page) -> dict[str, dict]:
         ...
       }
     """
-    logger.info("Navigating to connections page...")
-    await page.goto(CONNECTIONS_URL, wait_until="domcontentloaded")
-    await _pause(6, 9)  # extra wait for LinkedIn's JS to render cards
+    # Navigate to LinkedIn home to establish session (not connections page directly)
+    logger.info("Navigating to LinkedIn to establish session...")
+    await page.goto(f"{LINKEDIN_BASE}/mynetwork/", wait_until="domcontentloaded")
+    await _pause(2, 4)
 
-    # Wait for connection cards to actually render (LinkedIn loads them via JS)
-    try:
-        await page.wait_for_selector(
-            "li.mn-connection-card, "
-            "[data-view-name='connections-list-item'], "
-            ".scaffold-finite-scroll__content li",
-            timeout=15000,
-        )
-        logger.info("Connection cards detected on page.")
-    except Exception:
-        logger.warning("Timed out waiting for connection cards — page may be empty or blocked.")
+    # Extract CSRF token from JSESSIONID cookie (required for Voyager API)
+    cookies = await page.context.cookies()
+    csrf_token = next(
+        (c["value"].strip('"') for c in cookies if c["name"] == "JSESSIONID"),
+        ""
+    )
+    logger.info("CSRF token found: %s", "yes" if csrf_token else "NO — cannot call API")
 
-    # Debug: log total <li> count after waiting
-    all_li = await page.query_selector_all("li")
-    logger.info("Total <li> elements on page after wait: %d", len(all_li))
+    if not csrf_token:
+        logger.error("JSESSIONID cookie missing. Re-run save_cookies.py.")
+        return {}
+
+    # Call LinkedIn's internal Voyager API for 50 most recently added connections.
+    # This is more reliable than HTML scraping in headless/CI environments.
+    logger.info("Calling LinkedIn Voyager API for connections...")
+    data = await page.evaluate("""
+        async (csrfToken) => {
+            const url = '/voyager/api/relationships/dash/connections'
+                + '?decorationId=com.linkedin.voyager.dash.deco.web.mynetwork.ConnectionListWithDistance-5'
+                + '&count=50&q=search&sortType=RECENTLY_ADDED';
+            try {
+                const resp = await fetch(url, {
+                    headers: {
+                        'Accept': 'application/vnd.linkedin.normalized+json+2.1',
+                        'csrf-token': csrfToken,
+                        'x-restli-protocol-version': '2.0.0'
+                    },
+                    credentials: 'include'
+                });
+                if (!resp.ok) return { error: resp.status + ' ' + resp.statusText };
+                return await resp.json();
+            } catch(e) {
+                return { error: e.message };
+            }
+        }
+    """, csrf_token)
+
+    if not data or "error" in data:
+        logger.error("Voyager API failed: %s", data.get("error") if data else "null")
+        return {}
+
+    elements = data.get("elements", [])
+    logger.info("API returned %d connection elements", len(elements))
 
     connections: dict[str, dict] = {}
-    prev_count = -1
-
-    while True:
-        cards = await page.query_selector_all(
-            "li.mn-connection-card, "
-            "[data-view-name='connections-list-item'], "
-            ".mn-connection-card, "
-            ".scaffold-finite-scroll__content li, "
-            ".reusable-search__result-container"
-        )
-
-        for card in cards:
-            try:
-                # Profile URL
-                link_el = await card.query_selector("a[href*='/in/']")
-                if not link_el:
-                    continue
-                href = await link_el.get_attribute("href")
-                url = f"{LINKEDIN_BASE}{href.split('?')[0]}" if href.startswith("/") else href.split("?")[0]
-
-                if url in connections:
-                    continue  # already captured
-
-                # Name
-                name_el = await card.query_selector(
-                    ".mn-connection-card__name, "
-                    "[class*='connection-card__name'], "
-                    ".entity-result__title-text"
-                )
-                name = (await name_el.inner_text()).strip() if name_el else "Unknown"
-
-                # Headline
-                headline_el = await card.query_selector(
-                    ".mn-connection-card__occupation, "
-                    "[class*='connection-card__occupation'], "
-                    ".entity-result__primary-subtitle"
-                )
-                headline = (await headline_el.inner_text()).strip() if headline_el else ""
-
+    for element in elements:
+        try:
+            profile = element.get("connectedMemberResolutionResult", {})
+            if not profile:
+                continue
+            name = f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip()
+            identifier = profile.get("publicIdentifier", "")
+            if not identifier:
+                continue
+            url = f"{LINKEDIN_BASE}/in/{identifier}"
+            headline_raw = profile.get("headline", "")
+            headline = headline_raw if isinstance(headline_raw, str) else ""
+            if url not in connections:
                 connections[url] = {"name": name, "headline": headline, "url": url}
-
-            except Exception as e:
-                logger.debug("Error parsing connection card: %s", e)
-
-        current_count = len(connections)
-        logger.info("Connections scraped so far: %d", current_count)
-
-        if current_count == prev_count:
-            break  # no new cards loaded — we've reached the end
-        prev_count = current_count
-
-        # Scroll down to load more
-        await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-        await _pause(2, 4)
+        except Exception as e:
+            logger.debug("Error parsing connection element: %s", e)
 
     logger.info("Total connections scraped: %d", len(connections))
     return connections
