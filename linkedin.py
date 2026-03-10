@@ -94,162 +94,174 @@ async def get_connections(page: Page) -> dict[str, dict]:
         logger.error("JSESSIONID cookie missing. Re-run save_cookies.py.")
         return {}
 
-    # Call LinkedIn's internal Voyager API for 50 most recently added connections.
-    # The dash endpoint with plain JSON returns only URNs (no profile data).
-    # Normalized JSON bundles actual Profile objects in `included[]` — use that.
-    logger.info("Calling LinkedIn Voyager API for connections...")
-    result = await page.evaluate("""
-        async (csrfToken) => {
-            // Attempt 1: dash endpoint with normalized JSON → profiles in included[]
-            // Attempt 2: legacy endpoint with plain JSON → may embed profile data
-            const attempts = [
-                {
-                    url: '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
-                    accept: 'application/vnd.linkedin.normalized+json+2.1',
-                },
-                {
-                    url: '/voyager/api/relationships/connections?count=50&q=search&sortType=RECENTLY_ADDED&networkType=F',
-                    accept: 'application/json',
-                },
-            ];
-            for (const attempt of attempts) {
-                try {
-                    const resp = await fetch(attempt.url, {
+    # ── Step 2: Navigate to connections page and intercept LinkedIn's own API ────
+    # LinkedIn's JavaScript makes its own Voyager calls with all the right headers.
+    # We intercept those responses to collect profile + position data automatically.
+    # This is more reliable than calling the API ourselves.
+    logger.info("Setting up network interceptor for connections page...")
+
+    intercepted_profiles: dict[str, dict] = {}   # publicIdentifier → profile dict
+    intercepted_connections_urns: list[str] = []  # list of connectedMember URNs (order = recency)
+
+    import json as _json
+
+    async def _on_response(response):
+        url = response.url
+        if "voyager/api" not in url:
+            return
+        try:
+            text = await response.text()
+            data = _json.loads(text)
+        except Exception:
+            return
+
+        # Collect profile URNs from connections endpoint (preserves recency order)
+        if "relationships" in url and "connections" in url:
+            for item in data.get("included", []):
+                member = item.get("connectedMember", "")
+                if member and member not in intercepted_connections_urns:
+                    intercepted_connections_urns.append(member)
+
+        # Collect full profile data from any identity/profile endpoint
+        for item in data.get("included", []):
+            if not isinstance(item, dict):
+                continue
+            pid = item.get("publicIdentifier", "")
+            if not pid:
+                continue
+            # Merge: keep whichever copy has more fields (some calls return richer data)
+            existing = intercepted_profiles.get(pid, {})
+            if len(item) > len(existing):
+                intercepted_profiles[pid] = item
+
+    page.on("response", _on_response)
+
+    # Navigate — LinkedIn's app will fetch connections + mini-profiles automatically
+    logger.info("Navigating to connections page (intercepting API traffic)...")
+    await page.goto(CONNECTIONS_URL, wait_until="domcontentloaded")
+    await _pause(5, 7)   # give JS time to fire all the API calls
+
+    logger.info(
+        "Intercepted: %d profile URNs, %d profiles with data",
+        len(intercepted_connections_urns), len(intercepted_profiles),
+    )
+
+    # ── Step 3: If intercepted profiles are sparse, do a manual Voyager fetch ──
+    # Sometimes LinkedIn doesn't fire the profile detail calls immediately.
+    # Fall back to calling the connections + miniProfiles APIs ourselves.
+    if len(intercepted_profiles) < 5:
+        logger.info("Few profiles intercepted — calling Voyager API directly...")
+        api_result = await page.evaluate("""
+            async (csrfToken) => {
+                // Step A: get connection URNs
+                const connResp = await fetch(
+                    '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
+                    {
                         headers: {
-                            'Accept': attempt.accept,
+                            'Accept': 'application/vnd.linkedin.normalized+json+2.1',
                             'csrf-token': csrfToken,
                             'x-restli-protocol-version': '2.0.0',
-                            'x-li-lang': 'en_US',
                         },
-                        credentials: 'include'
-                    });
-                    const body = await resp.text();
-                    console.log('API ' + attempt.url.split('?')[0] +
-                                ' accept=' + attempt.accept.split('/').pop() +
-                                ' status=' + resp.status +
-                                ' preview=' + body.slice(0, 800));
-                    if (!resp.ok) {
-                        continue;
+                        credentials: 'include',
                     }
-                    const parsed = JSON.parse(body);
+                );
+                if (!connResp.ok) return { ok: false, error: 'connections ' + connResp.status };
+                const connData = JSON.parse(await connResp.text());
 
-                    // Skip responses that only contain URN elements (no profile data).
-                    // dash+plain-JSON returns {elements:[{connectedMember:"urn:...", ...}]}
-                    // which has no names/headlines — useless for us.
-                    const topElements = Array.isArray(parsed.elements) ? parsed.elements : [];
-                    const hasProfileData =
-                        topElements.some(e => e.connectedMemberResolutionResult || e.publicIdentifier) ||
-                        (Array.isArray(parsed.included) && parsed.included.some(e => e.publicIdentifier));
-                    if (topElements.length > 0 && !hasProfileData) {
-                        console.log('Skipping: elements contain only URNs, no profile data — trying next');
-                        continue;
-                    }
+                const memberUrns = (connData.included || [])
+                    .filter(e => e.$type && e.$type.toLowerCase().includes('connection') && e.connectedMember)
+                    .map(e => e.connectedMember);
 
-                    return { ok: true, accept: attempt.accept, parsed: parsed };
-                } catch(e) {
-                    console.log('API exception ' + attempt.url + ': ' + e.message);
+                console.log('Connection URNs found: ' + memberUrns.length);
+                if (!memberUrns.length) return { ok: false, error: 'no connection URNs' };
+
+                // Step B: batch-fetch miniProfiles for those URNs
+                // Profile IDs are everything after the last colon in the URN
+                const profileIds = memberUrns.map(u => u.split(':').pop());
+                const ids = profileIds.map(encodeURIComponent).join(',');
+
+                const miniUrl = '/voyager/api/identity/miniProfiles?ids=List(' + ids + ')';
+                const miniResp = await fetch(miniUrl, {
+                    headers: {
+                        'Accept': 'application/json',
+                        'csrf-token': csrfToken,
+                        'x-restli-protocol-version': '2.0.0',
+                    },
+                    credentials: 'include',
+                });
+                const miniBody = await miniResp.text();
+                console.log('MiniProfiles status=' + miniResp.status + ' preview=' + miniBody.slice(0, 400));
+
+                if (!miniResp.ok) {
+                    // Last resort: return the raw Connection URNs so we can at least build URLs
+                    return { ok: true, urnsOnly: true, urns: memberUrns, profiles: {} };
                 }
+
+                return { ok: true, urnsOnly: false, profiles: JSON.parse(miniBody), urns: memberUrns };
             }
-            return { ok: false, error: 'all endpoints failed' };
-        }
-    """, csrf_token)
+        """, csrf_token)
 
-    if not result or not result.get("ok"):
-        logger.error("Voyager API failed: %s", result.get("error") if result else "null")
-        return {}
+        if api_result and api_result.get("ok"):
+            # Add any profiles from the API call that weren't intercepted
+            profiles_raw = api_result.get("profiles") or {}
+            for key, item in (profiles_raw.get("results") or {}).items():
+                if isinstance(item, dict):
+                    pid = item.get("publicIdentifier", "")
+                    if pid and pid not in intercepted_profiles:
+                        intercepted_profiles[pid] = item
+            for item in (profiles_raw.get("included") or []):
+                if isinstance(item, dict):
+                    pid = item.get("publicIdentifier", "")
+                    if pid and pid not in intercepted_profiles:
+                        intercepted_profiles[pid] = item
+            # Also store URN ordering if not already set
+            if not intercepted_connections_urns:
+                intercepted_connections_urns.extend(api_result.get("urns") or [])
 
-    accept_used = result.get("accept", "")
-    data = result.get("parsed", {})
-    top_keys = list(data.keys()) if isinstance(data, dict) else []
-    logger.info("API response top-level keys: %s (accept=%s)", top_keys, accept_used)
+        logger.info("After manual fetch: %d profiles collected", len(intercepted_profiles))
 
-    # ── Plain-JSON: elements[] at top level with embedded profile data ─────────
-    raw_elements = []
-    plain_elements = data.get("elements", [])
-    if plain_elements and any(
-        e.get("connectedMemberResolutionResult") or e.get("publicIdentifier")
-        for e in plain_elements
-    ):
-        raw_elements = plain_elements
-        logger.info("Using plain-JSON elements: %d", len(raw_elements))
-
-    # ── Normalized-JSON: profile objects live in included[] ────────────────────
-    if not raw_elements:
-        included = data.get("included", [])
-        logger.info("Checking included[] (%d items) for profile data", len(included))
-
-        # Prefer Connection-typed objects (they hold the profile inside)
-        conn_items = [
-            item for item in included
-            if isinstance(item, dict) and "connection" in item.get("$type", "").lower()
-        ]
-        # Profile-typed objects with a publicIdentifier work too
-        profile_items = [
-            item for item in included
-            if isinstance(item, dict)
-            and "profile" in item.get("$type", "").lower()
-            and item.get("publicIdentifier")
-        ]
-        logger.info("  Connection items: %d, Profile items: %d", len(conn_items), len(profile_items))
-        raw_elements = conn_items if conn_items else profile_items
-
-    logger.info("Connection elements to parse: %d", len(raw_elements))
-
+    # ── Step 4: Build connections dict from collected profile data ────────────
     connections: dict[str, dict] = {}
-    _logged_keys = False
-    for element in raw_elements:
+
+    for profile in intercepted_profiles.values():
         try:
-            # Plain-JSON dash endpoint wraps the profile under this key
-            profile = element.get("connectedMemberResolutionResult") or {}
-
-            # Normalized profile object: the element itself carries the data
-            if not profile and element.get("publicIdentifier"):
-                profile = element
-
-            if not profile:
-                continue
-
-            # Log available keys on the first profile so we can see hidden company fields
-            if not _logged_keys:
-                logger.info("Profile object keys: %s", sorted(profile.keys()))
-                _logged_keys = True
-
             name = f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip()
             identifier = profile.get("publicIdentifier", "")
-            if not identifier:
+            if not name or not identifier:
                 continue
 
             url = f"{LINKEDIN_BASE}/in/{identifier}"
-            headline_raw = profile.get("headline", "")
-            headline = headline_raw if isinstance(headline_raw, str) else ""
+            headline = profile.get("headline", "") or ""
+            if not isinstance(headline, str):
+                headline = ""
 
-            # Try to extract the current company from the profile's position data.
-            # Many people don't put their employer in their headline (e.g. students),
-            # so we look for a 'currentPositionV2' / 'positions' field as a fallback.
+            # ── Extract current company from experience/position data ──────────
+            # LinkedIn API uses several field names depending on the endpoint used.
             current_company = ""
-            for pos_field in ("currentPositionV2", "currentPosition", "positions"):
+            for pos_field in (
+                "currentPositionV2", "currentPosition", "positions",
+                "currentPositions", "experience",
+            ):
                 pos_data = profile.get(pos_field)
                 if isinstance(pos_data, list) and pos_data:
                     first = pos_data[0]
-                    current_company = (
-                        first.get("companyName")
-                        or first.get("company", {}).get("name", "")
-                        if isinstance(first, dict) else ""
-                    )
-                    if current_company:
-                        break
+                    if isinstance(first, dict):
+                        current_company = (
+                            first.get("companyName")
+                            or first.get("company", {}).get("name", "")
+                            or first.get("companyUrn", "").split(":")[-1]
+                        )
+                        if current_company:
+                            break
                 elif isinstance(pos_data, dict):
                     current_company = pos_data.get("companyName", "")
                     if current_company:
                         break
 
-            if current_company:
-                logger.info(
-                    "  %s → headline='%s' | currentCompany='%s'",
-                    name, headline, current_company
-                )
-            else:
-                logger.info("  %s → headline='%s' (no currentCompany field)", name, headline)
+            logger.info(
+                "  %-30s headline='%s' | company='%s'",
+                name, headline[:50], current_company,
+            )
 
             if url not in connections:
                 connections[url] = {
@@ -259,7 +271,7 @@ async def get_connections(page: Page) -> dict[str, dict]:
                     "url": url,
                 }
         except Exception as e:
-            logger.debug("Error parsing connection element: %s", e)
+            logger.debug("Error building connection from profile: %s", e)
 
     logger.info("Total connections scraped: %d", len(connections))
     return connections
