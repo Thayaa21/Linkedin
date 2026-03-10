@@ -299,6 +299,56 @@ async def get_connections(page: Page) -> dict[str, dict]:
     return connections
 
 
+# ─── Profile company lookup ──────────────────────────────────────────────────
+
+async def get_csrf_token(page: Page) -> str:
+    """Return the CSRF token (JSESSIONID cookie value) for the current session."""
+    cookies = await page.context.cookies()
+    return next(
+        (c["value"].strip('"') for c in cookies if c["name"] == "JSESSIONID"),
+        "",
+    )
+
+
+async def get_profile_company(page: Page, public_identifier: str, csrf_token: str) -> str:
+    """
+    Calls the Voyager profile endpoint for one person and returns their
+    current employer extracted from their Experience/Positions data.
+
+    Used as a fallback when the headline doesn't mention a company name.
+    Returns "" on any error or if no position data is found.
+    """
+    result = await page.evaluate("""
+        async ([publicId, csrfToken]) => {
+            try {
+                const resp = await fetch('/voyager/api/identity/profiles/' + publicId, {
+                    headers: {
+                        'Accept': 'application/vnd.linkedin.normalized+json+2.1',
+                        'csrf-token': csrfToken,
+                        'x-restli-protocol-version': '2.0.0',
+                    },
+                    credentials: 'include',
+                });
+                if (!resp.ok) return '';
+                const data = JSON.parse(await resp.text());
+                const included = data.included || [];
+
+                // Prefer current positions (no timePeriod.endDate)
+                const positions = included.filter(e =>
+                    e.$type && e.$type.toLowerCase().includes('position')
+                );
+                const current = positions.find(p => !p.timePeriod?.endDate);
+                const best = current || positions[0];
+                if (!best) return '';
+                return best.companyName || (best.company && best.company.name) || '';
+            } catch (e) {
+                return '';
+            }
+        }
+    """, [public_identifier, csrf_token])
+    return result or ""
+
+
 # ─── Snapshot management ─────────────────────────────────────────────────────
 
 def load_snapshot() -> dict[str, dict]:

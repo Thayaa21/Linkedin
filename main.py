@@ -71,8 +71,10 @@ async def poll_connections():
             # Scrape current connections
             current = await li.get_connections(page)
 
-            # Diff against previous snapshot
-            old_snapshot = li.load_snapshot()
+            # ── Load snapshot from Google Sheets (persists across GH Actions runs) ──
+            old_snapshot = sheets.load_snapshot_from_sheet()
+            logger.info("Snapshot loaded: %d previously seen connections", len(old_snapshot))
+
             new_connections = li.diff_connections(old_snapshot, current)
             logger.info("New connections since last poll: %d", len(new_connections))
 
@@ -81,24 +83,41 @@ async def poll_connections():
                 applied_rows = sheets.get_applied_companies()
                 logger.info("Applied rows in sheet: %d", len(applied_rows))
 
+                # Get CSRF token once — reuse for all profile lookups
+                csrf_token = await li.get_csrf_token(page)
+
                 for conn in new_connections:
-                    headline       = conn.get("headline", "")
+                    headline        = conn.get("headline", "")
                     current_company = conn.get("current_company", "")
-                    company_hint   = m.extract_company_from_headline(headline)
+                    company_hint    = m.extract_company_from_headline(headline)
+
+                    # ── Enrich: if headline extraction looks weak, fetch profile ──
+                    # The profile Voyager API returns real work-experience company names.
+                    # We only call it when the headline didn't give us a clean company,
+                    # keeping API calls minimal.
+                    if not current_company and csrf_token:
+                        pub_id = conn["url"].split("/in/")[-1].rstrip("/")
+                        fetched = await li.get_profile_company(page, pub_id, csrf_token)
+                        if fetched:
+                            current_company = fetched
+                            conn["current_company"] = fetched
+                            logger.info(
+                                "  Enriched %s → company from profile: '%s'",
+                                conn["name"], current_company,
+                            )
 
                     logger.info(
-                        "New connection: %s | headline: '%s' | extracted: '%s' | currentCompany: '%s'",
+                        "New connection: %s | headline: '%s' | extracted: '%s' | company: '%s'",
                         conn["name"], headline, company_hint, current_company,
                     )
 
-                    # 1st attempt: match from headline
+                    # 1st attempt: match from headline extraction
                     matched_row = m.find_matching_row(company_hint, applied_rows)
 
-                    # 2nd attempt: match using the current_company field directly
-                    # (catches people whose headline shows school/title, not employer)
+                    # 2nd attempt: match using current company from work experience
                     if not matched_row and current_company:
                         logger.info(
-                            "Headline match failed — retrying with currentCompany: '%s'",
+                            "Headline match failed — retrying with company: '%s'",
                             current_company,
                         )
                         matched_row = m.find_matching_row(current_company, applied_rows)
@@ -117,8 +136,9 @@ async def poll_connections():
                     else:
                         logger.info("No sheet match for connection: %s", conn["name"])
 
-            # Always update snapshot with full current state
-            li.save_snapshot(current)
+            # ── Save snapshot back to Sheets so next run only sees truly new ones ──
+            sheets.save_snapshot_to_sheet(current)
+            logger.info("Snapshot saved to Sheets: %d connections", len(current))
 
         finally:
             await browser.close()
