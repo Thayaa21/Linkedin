@@ -77,8 +77,8 @@ async def get_connections(page: Page) -> dict[str, dict]:
       }
     """
     logger.info("Navigating to connections page...")
-    await page.goto(CONNECTIONS_URL, wait_until="networkidle")
-    await _pause(3, 5)
+    await page.goto(CONNECTIONS_URL, wait_until="domcontentloaded")
+    await _pause(6, 9)  # extra wait for LinkedIn's JS to render cards
 
     # Wait for connection cards to actually render (LinkedIn loads them via JS)
     try:
