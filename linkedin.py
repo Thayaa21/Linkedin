@@ -196,6 +196,7 @@ async def get_connections(page: Page) -> dict[str, dict]:
     logger.info("Connection elements to parse: %d", len(raw_elements))
 
     connections: dict[str, dict] = {}
+    _logged_keys = False
     for element in raw_elements:
         try:
             # Plain-JSON dash endpoint wraps the profile under this key
@@ -208,6 +209,11 @@ async def get_connections(page: Page) -> dict[str, dict]:
             if not profile:
                 continue
 
+            # Log available keys on the first profile so we can see hidden company fields
+            if not _logged_keys:
+                logger.info("Profile object keys: %s", sorted(profile.keys()))
+                _logged_keys = True
+
             name = f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip()
             identifier = profile.get("publicIdentifier", "")
             if not identifier:
@@ -216,8 +222,42 @@ async def get_connections(page: Page) -> dict[str, dict]:
             url = f"{LINKEDIN_BASE}/in/{identifier}"
             headline_raw = profile.get("headline", "")
             headline = headline_raw if isinstance(headline_raw, str) else ""
+
+            # Try to extract the current company from the profile's position data.
+            # Many people don't put their employer in their headline (e.g. students),
+            # so we look for a 'currentPositionV2' / 'positions' field as a fallback.
+            current_company = ""
+            for pos_field in ("currentPositionV2", "currentPosition", "positions"):
+                pos_data = profile.get(pos_field)
+                if isinstance(pos_data, list) and pos_data:
+                    first = pos_data[0]
+                    current_company = (
+                        first.get("companyName")
+                        or first.get("company", {}).get("name", "")
+                        if isinstance(first, dict) else ""
+                    )
+                    if current_company:
+                        break
+                elif isinstance(pos_data, dict):
+                    current_company = pos_data.get("companyName", "")
+                    if current_company:
+                        break
+
+            if current_company:
+                logger.info(
+                    "  %s → headline='%s' | currentCompany='%s'",
+                    name, headline, current_company
+                )
+            else:
+                logger.info("  %s → headline='%s' (no currentCompany field)", name, headline)
+
             if url not in connections:
-                connections[url] = {"name": name, "headline": headline, "url": url}
+                connections[url] = {
+                    "name": name,
+                    "headline": headline,
+                    "current_company": current_company,
+                    "url": url,
+                }
         except Exception as e:
             logger.debug("Error parsing connection element: %s", e)
 

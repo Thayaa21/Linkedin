@@ -82,13 +82,27 @@ async def poll_connections():
                 logger.info("Applied rows in sheet: %d", len(applied_rows))
 
                 for conn in new_connections:
-                    company_hint = m.extract_company_from_headline(conn["headline"])
+                    headline       = conn.get("headline", "")
+                    current_company = conn.get("current_company", "")
+                    company_hint   = m.extract_company_from_headline(headline)
+
                     logger.info(
-                        "New connection: %s | headline: %s | extracted company: %s",
-                        conn["name"], conn["headline"], company_hint,
+                        "New connection: %s | headline: '%s' | extracted: '%s' | currentCompany: '%s'",
+                        conn["name"], headline, company_hint, current_company,
                     )
 
+                    # 1st attempt: match from headline
                     matched_row = m.find_matching_row(company_hint, applied_rows)
+
+                    # 2nd attempt: match using the current_company field directly
+                    # (catches people whose headline shows school/title, not employer)
+                    if not matched_row and current_company:
+                        logger.info(
+                            "Headline match failed — retrying with currentCompany: '%s'",
+                            current_company,
+                        )
+                        matched_row = m.find_matching_row(current_company, applied_rows)
+
                     if matched_row:
                         logger.info(
                             "Matched! %s → row %d (%s @ %s)",
