@@ -15,7 +15,7 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-       - name: Write credentials
+      - name: Write credentials
         run: |
           echo '${{ secrets.GOOGLE_CREDS_JSON }}' | base64 -d > google_creds.json
           echo '${{ secrets.LINKEDIN_COOKIES }}' | base64 -d > linkedin_cookies.json
