@@ -91,15 +91,14 @@ async def poll_connections():
                     current_company = conn.get("current_company", "")
                     company_hint    = m.extract_company_from_headline(headline)
 
-                    # ── Enrich via profile API if headline didn't yield a match ──
-                    # Only call the profile API when:
-                    #   a) we have no current_company from the scrape, AND
-                    #   b) the headline extraction didn't produce a clean company
-                    #      (i.e. it's empty, or it still has no match in the sheet)
-                    headline_matched = bool(m.find_matching_row(company_hint, applied_rows))
-                    need_enrich = not current_company and not headline_matched and csrf_token
+                    # ── Enrich via profile API if we don't already have a company ──
+                    # Call profile API whenever current_company is empty AND we have
+                    # a CSRF token.  We no longer skip based on headline_matched —
+                    # we always want the real employer in the snapshot.
+                    need_enrich = not current_company and bool(csrf_token)
                     if need_enrich:
                         pub_id = conn["url"].split("/in/")[-1].rstrip("/")
+                        logger.info("  Enriching %s (pub_id=%s)…", conn["name"], pub_id)
                         fetched = await li.get_profile_company(page, pub_id, csrf_token)
                         if fetched:
                             current_company = fetched
@@ -108,6 +107,10 @@ async def poll_connections():
                                 "  Enriched %s → work-exp company: '%s'",
                                 conn["name"], current_company,
                             )
+                        else:
+                            logger.info("  No company found for %s after enrichment", conn["name"])
+                        # Small pause so we don't hammer the LinkedIn API
+                        await asyncio.sleep(0.8)
 
                     logger.info(
                         "New connection: %s | headline: '%s' | extracted: '%s' | company: '%s'",

@@ -100,8 +100,10 @@ async def get_connections(page: Page) -> dict[str, dict]:
     # This is more reliable than calling the API ourselves.
     logger.info("Setting up network interceptor for connections page...")
 
-    intercepted_profiles: dict[str, dict] = {}   # publicIdentifier → profile dict
-    intercepted_connections_urns: list[str] = []  # list of connectedMember URNs (order = recency)
+    intercepted_profiles: dict[str, dict] = {}    # publicIdentifier → profile dict
+    intercepted_connections_urns: list[str] = []   # connectedMember URNs (recency order)
+    intercepted_companies: dict[str, str] = {}     # company entityUrn → name
+    intercepted_positions: dict[str, str] = {}     # profile entityUrn → company name
 
     import json as _json
 
@@ -115,21 +117,54 @@ async def get_connections(page: Page) -> dict[str, dict]:
         except Exception:
             return
 
+        included = data.get("included", [])
+
         # Collect profile URNs from connections endpoint (preserves recency order)
         if "relationships" in url and "connections" in url:
-            for item in data.get("included", []):
+            for item in included:
+                if not isinstance(item, dict):
+                    continue
                 member = item.get("connectedMember", "")
                 if member and member not in intercepted_connections_urns:
                     intercepted_connections_urns.append(member)
 
-        # Collect full profile data from any identity/profile endpoint
-        for item in data.get("included", []):
+        for item in included:
             if not isinstance(item, dict):
                 continue
+            item_type = item.get("$type", "")
+
+            # ── Collect Company objects for URN resolution ────────────────────
+            if item_type and ("Company" in item_type or "MiniCompany" in item_type):
+                urn = item.get("entityUrn") or item.get("objectUrn", "")
+                name = item.get("name", "")
+                if urn and name:
+                    intercepted_companies[urn] = name
+
+            # ── Collect Position data (current positions only) ────────────────
+            if item_type and ("Position" in item_type or "WorkExperience" in item_type):
+                # Only current positions (no end date)
+                tp = item.get("timePeriod", {}) or {}
+                dr = item.get("dateRange", {}) or {}
+                if not tp.get("endDate") and not dr.get("end"):
+                    profile_urn = (item.get("profileUrn")
+                                   or item.get("*profileUrn", ""))
+                    comp_name = item.get("companyName", "")
+                    if not comp_name:
+                        comp_ref = (item.get("*company")
+                                    or item.get("companyUrn", "")
+                                    or item.get("company", ""))
+                        if isinstance(comp_ref, str):
+                            comp_name = intercepted_companies.get(comp_ref, "")
+                        elif isinstance(comp_ref, dict):
+                            comp_name = comp_ref.get("name", "")
+                    if comp_name and profile_urn:
+                        intercepted_positions[profile_urn] = comp_name
+
+            # ── Collect profile objects ────────────────────────────────────────
             pid = item.get("publicIdentifier", "")
             if not pid:
                 continue
-            # Merge: keep whichever copy has more fields (some calls return richer data)
+            # Merge: keep whichever copy has more fields
             existing = intercepted_profiles.get(pid, {})
             if len(item) > len(existing):
                 intercepted_profiles[pid] = item
@@ -155,8 +190,9 @@ async def get_connections(page: Page) -> dict[str, dict]:
     await _pause(2, 3)  # final wait for any in-flight requests
 
     logger.info(
-        "Intercepted: %d profile URNs, %d profiles with data",
+        "Intercepted: %d profile URNs, %d profiles, %d positions, %d companies",
         len(intercepted_connections_urns), len(intercepted_profiles),
+        len(intercepted_positions), len(intercepted_companies),
     )
 
     # ── Step 3: If scrolling didn't yield profiles, fall back to API ──────────
@@ -257,28 +293,45 @@ async def get_connections(page: Page) -> dict[str, dict]:
             if not isinstance(headline, str):
                 headline = ""
 
-            # ── Extract current company from experience/position data ──────────
-            # LinkedIn API uses several field names depending on the endpoint used.
+            # ── Extract current company ───────────────────────────────────────
+            # Priority:
+            #   1. Positions captured from intercepted API responses (most reliable)
+            #   2. Inline fields on the profile object (currentPositionV2, etc.)
             current_company = ""
-            for pos_field in (
-                "currentPositionV2", "currentPosition", "positions",
-                "currentPositions", "experience",
-            ):
-                pos_data = profile.get(pos_field)
-                if isinstance(pos_data, list) and pos_data:
-                    first = pos_data[0]
-                    if isinstance(first, dict):
-                        current_company = (
-                            first.get("companyName")
-                            or first.get("company", {}).get("name", "")
-                            or first.get("companyUrn", "").split(":")[-1]
-                        )
+
+            # 1) Check positions captured during scroll
+            profile_urn = profile.get("entityUrn") or profile.get("objectUrn", "")
+            if profile_urn:
+                current_company = intercepted_positions.get(profile_urn, "")
+
+            # 2) Fallback: inline position fields on the profile
+            if not current_company:
+                for pos_field in (
+                    "currentPositionV2", "currentPosition", "positions",
+                    "currentPositions", "experience",
+                ):
+                    pos_data = profile.get(pos_field)
+                    if isinstance(pos_data, list) and pos_data:
+                        first = pos_data[0]
+                        if isinstance(first, dict):
+                            current_company = (
+                                first.get("companyName")
+                                or first.get("company", {}).get("name", "")
+                                or ""
+                            )
+                            if not current_company:
+                                # try resolving URN
+                                ref = (first.get("*company")
+                                       or first.get("companyUrn", "")
+                                       or first.get("company", ""))
+                                if isinstance(ref, str):
+                                    current_company = intercepted_companies.get(ref, "")
+                            if current_company:
+                                break
+                    elif isinstance(pos_data, dict):
+                        current_company = pos_data.get("companyName", "")
                         if current_company:
                             break
-                elif isinstance(pos_data, dict):
-                    current_company = pos_data.get("companyName", "")
-                    if current_company:
-                        break
 
             logger.info(
                 "  %-30s headline='%s' | company='%s'",
@@ -313,8 +366,9 @@ async def get_csrf_token(page: Page) -> str:
 async def get_profile_company(page: Page, public_identifier: str, csrf_token: str) -> str:
     """
     Fetches the person's current employer from their LinkedIn work experience.
-    Tries three endpoints in order — stops at the first that returns data.
+    Tries four endpoints in order — stops at the first that returns data.
     Returns "" on any error or if no position data is found.
+    All attempts are logged via console.log (captured by the page's console listener).
     """
     result = await page.evaluate("""
         async ([publicId, csrfToken]) => {
@@ -326,61 +380,125 @@ async def get_profile_company(page: Page, public_identifier: str, csrf_token: st
 
             function extractCompany(included) {
                 if (!Array.isArray(included)) return '';
+
+                // Build a company URN → name lookup from Company/MiniCompany objects
+                const companies = {};
+                for (const e of included) {
+                    if (!e || !e.$type) continue;
+                    const t = e.$type.toLowerCase();
+                    if (t.includes('company') || t.includes('minicompany')) {
+                        const urn = e.entityUrn || e.objectUrn || '';
+                        if (urn && e.name) companies[urn] = e.name;
+                    }
+                }
+
+                // Find Position / WorkExperience objects
                 const positions = included.filter(e =>
-                    e.$type && e.$type.toLowerCase().includes('position')
+                    e && e.$type && (
+                        e.$type.toLowerCase().includes('position') ||
+                        e.$type.toLowerCase().includes('workexperience')
+                    )
                 );
-                // Prefer current position (no end date)
-                const current = positions.find(p => !p.timePeriod?.endDate);
+                if (!positions.length) return '';
+
+                // Prefer a current position (no end date)
+                const current = positions.find(
+                    p => !p.timePeriod?.endDate && !p.dateRange?.end
+                );
                 const best = current || positions[0];
                 if (!best) return '';
-                return best.companyName
-                    || (best.company && best.company.name)
-                    || '';
+
+                // 1) Direct string field
+                if (best.companyName) return best.companyName;
+                // 2) Nested company object
+                if (best.company && typeof best.company === 'object' && best.company.name)
+                    return best.company.name;
+                // 3) Resolve *company URN reference (LinkedIn normalized JSON)
+                const ref = best['*company'] || best.companyUrn
+                    || (typeof best.company === 'string' ? best.company : '');
+                if (ref) return companies[ref] || '';
+
+                return '';
             }
 
-            // Attempt 1: dedicated positions endpoint (most direct)
+            // ── Attempt 1: dedicated /positions endpoint ───────────────────────
             try {
                 const r = await fetch(
                     '/voyager/api/identity/profiles/' + publicId + '/positions',
                     { headers, credentials: 'include' }
                 );
+                const body = await r.text();
+                console.log('[enrich1] ' + publicId + ' → ' + r.status + ' ' + body.slice(0, 120));
                 if (r.ok) {
-                    const d = JSON.parse(await r.text());
-                    const company = extractCompany(d.included || [])
-                        || extractCompany(d.elements || []);
-                    if (company) return company;
+                    const d = JSON.parse(body);
+                    const c = extractCompany(d.included || [])
+                           || extractCompany(d.elements  || []);
+                    if (c) { console.log('[enrich1] company=' + c); return c; }
+                    console.log('[enrich1] no company in response');
                 }
-            } catch(e) {}
+            } catch(e) { console.log('[enrich1] error: ' + e.message); }
 
-            // Attempt 2: full profile with explicit projection for positions
+            // ── Attempt 2: full profile (no projection) ────────────────────────
+            // Returns a large normalized response — positions are in included[]
+            try {
+                const r = await fetch(
+                    '/voyager/api/identity/profiles/' + publicId,
+                    { headers, credentials: 'include' }
+                );
+                const body = await r.text();
+                console.log('[enrich2] ' + publicId + ' → ' + r.status + ' ' + body.slice(0, 120));
+                if (r.ok) {
+                    const d = JSON.parse(body);
+                    const c = extractCompany(d.included || []);
+                    if (c) { console.log('[enrich2] company=' + c); return c; }
+                    // Also check positionView (legacy field)
+                    const pv = d.positionView || (d.data && d.data.positionView);
+                    if (pv && pv.elements && pv.elements.length) {
+                        const first = pv.elements[0];
+                        const c2 = first.companyName
+                               || (first.company && first.company.name)
+                               || '';
+                        if (c2) { console.log('[enrich2-pv] company=' + c2); return c2; }
+                    }
+                    console.log('[enrich2] no company in response');
+                }
+            } catch(e) { console.log('[enrich2] error: ' + e.message); }
+
+            // ── Attempt 3: dash profile by vanityName ──────────────────────────
+            // This is the endpoint LinkedIn's own SPA uses when you open a profile
+            try {
+                const r = await fetch(
+                    '/voyager/api/identity/dash/profiles?q=viewee&vieweeVanityName=' + publicId,
+                    { headers, credentials: 'include' }
+                );
+                const body = await r.text();
+                console.log('[enrich3] ' + publicId + ' → ' + r.status + ' ' + body.slice(0, 180));
+                if (r.ok) {
+                    const d = JSON.parse(body);
+                    const c = extractCompany(d.included || []);
+                    if (c) { console.log('[enrich3] company=' + c); return c; }
+                    console.log('[enrich3] no company in response');
+                }
+            } catch(e) { console.log('[enrich3] error: ' + e.message); }
+
+            // ── Attempt 4: profile with profileView projection ─────────────────
             try {
                 const r = await fetch(
                     '/voyager/api/identity/profiles/' + publicId +
-                    '?projection=(positions)',
+                    '?projection=(profileView)',
                     { headers, credentials: 'include' }
                 );
+                const body = await r.text();
+                console.log('[enrich4] ' + publicId + ' → ' + r.status + ' ' + body.slice(0, 180));
                 if (r.ok) {
-                    const d = JSON.parse(await r.text());
-                    const company = extractCompany(d.included || []);
-                    if (company) return company;
+                    const d = JSON.parse(body);
+                    const c = extractCompany(d.included || []);
+                    if (c) { console.log('[enrich4] company=' + c); return c; }
+                    console.log('[enrich4] no company in response');
                 }
-            } catch(e) {}
+            } catch(e) { console.log('[enrich4] error: ' + e.message); }
 
-            // Attempt 3: dash profile endpoint
-            try {
-                const r = await fetch(
-                    '/voyager/api/identity/dash/profiles/' +
-                    encodeURIComponent('urn:li:fsd_profile:' + publicId) +
-                    '?projection=(profileView,positions)',
-                    { headers, credentials: 'include' }
-                );
-                if (r.ok) {
-                    const d = JSON.parse(await r.text());
-                    const company = extractCompany(d.included || []);
-                    if (company) return company;
-                }
-            } catch(e) {}
-
+            console.log('[enrich] all 4 attempts failed for ' + publicId);
             return '';
         }
     """, [public_identifier, csrf_token])
