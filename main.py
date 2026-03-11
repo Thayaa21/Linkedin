@@ -19,6 +19,8 @@ import asyncio
 import logging
 from datetime import datetime
 
+SEND_DELAY_SECONDS = 5  # Delay between sends to avoid rate limiting
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -213,11 +215,6 @@ async def send_messages():
     Sends DMs to all Pending rows in Sent sheet.
     Updates Status to Message Sent on success.
     """
-    today = datetime.now()
-    if today.weekday() >= 5:
-        logger.info("send_messages: skipping — weekend")
-        return
-
     logger.info("=== send_messages started ===")
     pending = sheets.get_pending_rows()
     logger.info("Pending rows to message: %d", len(pending))
@@ -241,7 +238,7 @@ async def send_messages():
                 return
 
             already_sent = sheets.get_sent_li_urls()
-            for row in pending:
+            for i, row in enumerate(pending):
                 profile_url = row["li_url"]
                 company     = row["company"]
                 role        = row["role"]
@@ -267,13 +264,20 @@ async def send_messages():
                     resume_link=resume_link,
                 )
 
-                success = await li.send_message(page, profile_url, message)
+                try:
+                    success = await li.send_message(page, profile_url, message)
+                    if success:
+                        sheets.mark_sent_in_sent_sheet(row["row_index"])
+                        already_sent.add(sheets.normalize_li_url(profile_url))
+                        logger.info("Sent %d/%d: %s", i + 1, len(pending), li_name)
+                    else:
+                        logger.warning("Failed to send to %s, will retry next run.", li_name)
+                except Exception as e:
+                    logger.error("Error sending to %s: %s — continuing to next", li_name, e)
 
-                if success:
-                    sheets.mark_sent_in_sent_sheet(row["row_index"])
-                    already_sent.add(sheets.normalize_li_url(profile_url))
-                else:
-                    logger.warning("Failed to send to %s, will retry next run.", li_name)
+                # Delay between sends to avoid rate limiting
+                if i < len(pending) - 1:
+                    await asyncio.sleep(SEND_DELAY_SECONDS)
 
         finally:
             await browser.close()

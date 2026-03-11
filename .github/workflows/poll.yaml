@@ -1,7 +1,8 @@
 name: Poll LinkedIn Connections
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */6 * * *'    # Poll every 6 hours
+    - cron: '0 16 * * *'     # Send at 9 AM MST daily (incl weekends)
   workflow_dispatch:
 
 jobs:
@@ -30,3 +31,13 @@ jobs:
           COOKIES_FILE: linkedin_cookies.json
           CONNECTIONS_SNAPSHOT: connections_snapshot.json
         run: python -c "import asyncio; from main import poll_connections; asyncio.run(poll_connections())"
+
+      - name: Run send (9 AM MST daily)
+        if: github.event_name == 'schedule' && github.event.schedule == '0 16 * * *'
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_TAB: ${{ secrets.SHEET_TAB }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          GOOGLE_CREDS_FILE: google_creds.json
+          COOKIES_FILE: linkedin_cookies.json
+        run: python -c "import asyncio; from main import send_messages; asyncio.run(send_messages())"

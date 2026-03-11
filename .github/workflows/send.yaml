@@ -1,7 +1,7 @@
 name: Send LinkedIn Messages
 on:
   schedule:
-    - cron: '0 16 * * 1-5'   # 9 AM MST (UTC-7), Mon–Fri
+    - cron: '0 16 * * *'     # 9 AM MST (UTC-7), daily incl weekends
   workflow_dispatch:
 
 jobs:
