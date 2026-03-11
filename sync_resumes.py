@@ -1,16 +1,16 @@
 """
-sync_resumes.py — Fetch resume links from Google Drive and store in the sheet.
+sync_resumes.py — Resume links are now fetched from Drive at send time.
 
-Run when you've uploaded new resumes to Drive and want to update the sheet
-without running the full poll.
+The agent no longer stores resume links in the sheet. When sending a DM,
+it looks up Thayaa_{Company}.pdf in the Drive folder.
 
-Usage:
-    python sync_resumes.py
+Ensure your resumes are named: Thayaa_{Company}.pdf (e.g. Thayaa_Nokia.pdf)
+and have "Anyone with the link can view" sharing enabled.
+
+This script is kept for backwards compatibility but does nothing.
 """
 
 import logging
-import sheets
-import drive
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,19 +21,10 @@ logger = logging.getLogger("sync_resumes")
 
 
 def main():
-    logger.info("Fetching resume links from Drive...")
-    rows = sheets.get_rows_needing_resume()
-    logger.info("Rows needing resume: %d", len(rows))
-
-    for row in rows:
-        link = drive.get_resume_link(row["company"])
-        if link:
-            sheets.store_resume_link(row["row_index"], link)
-            logger.info("Stored: %s → row %d", row["company"], row["row_index"])
-        else:
-            logger.info("Not found: %s (row %d)", row["company"], row["row_index"])
-
-    logger.info("Done.")
+    logger.info(
+        "Resume links are fetched from Drive at send time. "
+        "No sync needed. Ensure Thayaa_{Company}.pdf files exist in your Drive folder."
+    )
 
 
 if __name__ == "__main__":

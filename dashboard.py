@@ -5,9 +5,8 @@ Run locally:
     streamlit run dashboard.py
 
 Shows:
-  - Status breakdown (Applied / Pending / Sent / No Resume)
-  - Full applications table with colour-coded statuses
-  - Manual trigger buttons for Poll and Send workflows (needs GH_TOKEN + GH_REPO)
+  - Tracker: Applied Date, Company, Role, Job URL, Status (5 cols)
+  - Sent sheet: Name, Company, LinkedIn ID, Job URL (people we've messaged)
 """
 
 import os
@@ -24,6 +23,7 @@ from google.oauth2.service_account import Credentials
 
 SHEET_ID        = os.environ["SHEET_ID"]
 SHEET_TAB       = os.environ.get("SHEET_TAB", "Applications")
+SENT_TAB        = os.environ.get("SENT_TAB", "Sent Messages")
 GOOGLE_CREDS    = os.environ.get("GOOGLE_CREDS_FILE", "google_creds.json")
 
 SCOPES = [
@@ -41,24 +41,45 @@ STATUS_COLORS = {
 
 # ── GitHub Actions dispatch ────────────────────────────────────────────────────
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
-GH_REPO  = os.environ.get("GH_REPO", "")   # e.g. "Thayaa21/linkedin-agent"
+GH_REPO  = os.environ.get("GH_REPO", "")
 
 
 @st.cache_data(ttl=60)
-def load_sheet() -> pd.DataFrame:
+def load_tracker() -> pd.DataFrame:
+    """Load Tracker sheet (5 columns)."""
     creds = Credentials.from_service_account_file(GOOGLE_CREDS, scopes=SCOPES)
-    gc    = gspread.authorize(creds)
-    ws    = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
-    rows  = ws.get_all_values()
+    gc = gspread.authorize(creds)
+    try:
+        ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame()
+    rows = ws.get_all_values()
     if len(rows) < 2:
         return pd.DataFrame()
-    headers = ["Applied Date", "Company", "Role", "Job URL", "Status", "Name", "LinkedIn ID", "Resume Link"]
+    headers = ["Applied Date", "Company", "Role", "Job URL", "Status"]
     data = []
     for row in rows[1:]:
-        # Support legacy (9 cols with Source) or new (8 cols)
-        if len(row) >= 9:
-            row = [row[0][:10] if row[0] else "", row[1], row[2], row[3], row[4], row[6], row[7], row[8] if len(row) > 8 else ""]
-        padded = (row + [""] * 8)[:8]
+        padded = (row + [""] * 5)[:5]
+        data.append(padded)
+    return pd.DataFrame(data, columns=headers)
+
+
+@st.cache_data(ttl=60)
+def load_sent() -> pd.DataFrame:
+    """Load Sent Messages sheet (Name, Company, LinkedIn ID, Job URL, Role, Status)."""
+    creds = Credentials.from_service_account_file(GOOGLE_CREDS, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    try:
+        ws = gc.open_by_key(SHEET_ID).worksheet(SENT_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame()
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return pd.DataFrame()
+    headers = ["Name", "Company", "LinkedIn ID", "Job URL", "Role", "Status"]
+    data = []
+    for row in rows[1:]:
+        padded = (row + [""] * 6)[:6]
         data.append(padded)
     return pd.DataFrame(data, columns=headers)
 
@@ -82,21 +103,23 @@ def trigger_workflow(workflow_file: str) -> tuple[bool, str]:
 st.set_page_config(page_title="LinkedIn Agent Monitor", page_icon="🤖", layout="wide")
 st.title("🤖 LinkedIn Agent Monitor")
 
-df = load_sheet()
+df_tracker = load_tracker()
+df_sent = load_sent()
 
-if df.empty:
-    st.warning("No data found in the sheet.")
+if df_tracker.empty and df_sent.empty:
+    st.warning("No data found in the sheets.")
     st.stop()
 
 # ── Stats row ──────────────────────────────────────────────────────────────────
-counts = df["Status"].value_counts().to_dict()
+tracker_counts = df_tracker["Status"].value_counts().to_dict() if not df_tracker.empty else {}
+sent_counts = df_sent["Status"].value_counts().to_dict() if not df_sent.empty else {}
 
 col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("📋 Applied",         counts.get("Applied", 0))
-col2.metric("⏳ Pending Message", counts.get("Pending Message", 0))
-col3.metric("✅ Message Sent",    counts.get("Message Sent", 0))
-col4.metric("❌ No Resume",       counts.get("No Resume", 0))
-col5.metric("💬 Already Messaged",counts.get("Already Messaged", 0))
+col1.metric("📋 Applied", tracker_counts.get("Applied", 0))
+col2.metric("⏳ Pending Message", sent_counts.get("Pending Message", 0))
+col3.metric("✅ Message Sent", sent_counts.get("Message Sent", 0))
+col4.metric("❌ No Resume", sent_counts.get("No Resume", 0))
+col5.metric("💬 Already Messaged", tracker_counts.get("Already Messaged", 0) + sent_counts.get("Already Messaged", 0))
 
 st.divider()
 
@@ -118,37 +141,36 @@ if GH_TOKEN and GH_REPO:
             st.error(f"Failed to trigger send — {err}")
     st.divider()
 
-# ── Per-status sections ────────────────────────────────────────────────────────
+# ── Sent sheet: People we've messaged (main view) ────────────────────────────────
+st.subheader("📨 Sent Messages — People & Companies")
+if df_sent.empty:
+    st.info("No people in Sent sheet yet.")
+else:
+    st.dataframe(
+        df_sent[["Name", "Company", "LinkedIn ID", "Job URL", "Status"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
 st.subheader("Pending — waiting to send DM")
-pending = df[df["Status"] == "Pending Message"][["Company", "Role", "Name", "LinkedIn ID", "Applied Date"]]
+pending = df_sent[df_sent["Status"] == "Pending Message"] if not df_sent.empty else pd.DataFrame()
 if pending.empty:
     st.info("No rows pending.")
 else:
-    st.dataframe(pending, use_container_width=True, hide_index=True)
+    st.dataframe(pending[["Name", "Company", "LinkedIn ID", "Job URL"]], use_container_width=True, hide_index=True)
 
 st.subheader("Sent")
-sent = df[df["Status"] == "Message Sent"][["Company", "Role", "Name", "LinkedIn ID", "Applied Date"]]
+sent = df_sent[df_sent["Status"] == "Message Sent"] if not df_sent.empty else pd.DataFrame()
 if sent.empty:
     st.info("No messages sent yet.")
 else:
-    st.dataframe(sent, use_container_width=True, hide_index=True)
+    st.dataframe(sent[["Name", "Company", "LinkedIn ID", "Job URL"]], use_container_width=True, hide_index=True)
 
-st.subheader("Applied — waiting for a connection")
-applied = df[df["Status"] == "Applied"][["Company", "Role", "Job URL", "Applied Date"]]
-if applied.empty:
-    st.info("No applied rows.")
+# ── Tracker: Applications ──────────────────────────────────────────────────────
+st.subheader("📋 Tracker — Applications (Applied Date, Company, Role, Job URL, Status)")
+if df_tracker.empty:
+    st.info("No tracker data.")
 else:
-    st.dataframe(applied, use_container_width=True, hide_index=True)
-
-st.subheader("No Resume / Issues")
-issues = df[df["Status"].isin(["No Resume", "Already Messaged"])][["Company", "Role", "Status", "Applied Date"]]
-if issues.empty:
-    st.info("No issues.")
-else:
-    st.dataframe(issues, use_container_width=True, hide_index=True)
-
-# ── Full table (collapsed) ─────────────────────────────────────────────────────
-with st.expander("View all rows"):
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df_tracker, use_container_width=True, hide_index=True)
 
 st.caption("Data refreshes every 60 seconds. Click the refresh button in the top-right to force reload.")
