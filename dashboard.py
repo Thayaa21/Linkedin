@@ -52,7 +52,7 @@ def load_sheet() -> pd.DataFrame:
     rows  = ws.get_all_values()
     if len(rows) < 2:
         return pd.DataFrame()
-    headers = ["Applied Date", "Company", "Role", "Job URL", "Status", "LI Name", "LI URL", "Resume Link"]
+    headers = ["Applied Date", "Company", "Role", "Job URL", "Status", "Name", "LinkedIn ID", "Resume Link"]
     data = []
     for row in rows[1:]:
         # Support legacy (9 cols with Source) or new (8 cols)
@@ -120,14 +120,14 @@ if GH_TOKEN and GH_REPO:
 
 # ── Per-status sections ────────────────────────────────────────────────────────
 st.subheader("Pending — waiting to send DM")
-pending = df[df["Status"] == "Pending Message"][["Company", "Role", "LI Name", "LI URL", "Applied Date"]]
+pending = df[df["Status"] == "Pending Message"][["Company", "Role", "Name", "LinkedIn ID", "Applied Date"]]
 if pending.empty:
     st.info("No rows pending.")
 else:
     st.dataframe(pending, use_container_width=True, hide_index=True)
 
 st.subheader("Sent")
-sent = df[df["Status"] == "Message Sent"][["Company", "Role", "LI Name", "LI URL", "Applied Date"]]
+sent = df[df["Status"] == "Message Sent"][["Company", "Role", "Name", "LinkedIn ID", "Applied Date"]]
 if sent.empty:
     st.info("No messages sent yet.")
 else:

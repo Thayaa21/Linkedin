@@ -11,6 +11,7 @@ load_dotenv()
 # ─── Google ───────────────────────────────────────────────────────────────────
 SHEET_ID          = os.environ['SHEET_ID']           # Google Sheet ID
 SHEET_TAB         = os.environ.get('SHEET_TAB', 'Applications')
+SENT_TAB          = os.environ.get('SENT_TAB', 'Sent Messages')  # People we've messaged
 GOOGLE_CREDS_FILE = os.environ.get('GOOGLE_CREDS_FILE', 'google_creds.json')  # service account JSON
 DRIVE_FOLDER_ID   = os.environ['DRIVE_FOLDER_ID']   # Drive folder containing resumes
 

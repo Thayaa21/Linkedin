@@ -11,7 +11,7 @@ Status lifecycle:
 import re
 import gspread
 from google.oauth2.service_account import Credentials
-from config import SHEET_ID, SHEET_TAB, GOOGLE_CREDS_FILE
+from config import SHEET_ID, SHEET_TAB, SENT_TAB, GOOGLE_CREDS_FILE
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -37,7 +37,7 @@ STATUS_SENT             = "Message Sent"
 STATUS_NO_RESUME        = "No Resume"
 STATUS_ALREADY_MESSAGED = "Already Messaged"
 
-TRACKER_HEADERS = ["Applied Date", "Company", "Role", "Job URL", "Status", "LI Name", "LI URL", "Resume Link"]
+TRACKER_HEADERS = ["Applied Date", "Company", "Role", "Job URL", "Status", "Name", "LinkedIn ID", "Resume Link"]
 
 
 def _client():
@@ -47,6 +47,37 @@ def _client():
 
 def _worksheet():
     return _client().open_by_key(SHEET_ID).worksheet(SHEET_TAB)
+
+
+def refine_tracker_sheet():
+    """
+    Refines the tracker: timestamp→date, removes Source, adds headers.
+    Call at poll start — cleans data from extension (timestamp, Source).
+    """
+    ws = _worksheet()
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return
+
+    new_rows = [TRACKER_HEADERS]
+    for row in rows[1:]:
+        if len(row) < 5:
+            continue
+        # Legacy (9 cols): A=Timestamp, B=Company, C=Role, D=URL, E=Status, F=Source, G=Name, H=LI URL, I=Resume
+        # Already refined (8 cols): A=Date, B=Company, C=Role, D=URL, E=Status, F=Name, G=LI URL, H=Resume
+        is_legacy = len(row) >= 9
+        applied_date = _to_applied_date(row[0]) if row else ""
+        company = row[1] if len(row) > 1 else ""
+        role = row[2] if len(row) > 2 else ""
+        job_url = row[3] if len(row) > 3 else ""
+        status = row[4] if len(row) > 4 else ""
+        name = row[6] if is_legacy and len(row) > 6 else (row[5] if len(row) > 5 else "")
+        li_url = row[7] if is_legacy and len(row) > 7 else (row[6] if len(row) > 6 else "")
+        resume = row[8] if is_legacy and len(row) > 8 else (row[7] if len(row) > 7 else "")
+        new_rows.append([applied_date, company, role, job_url, status, name, li_url, resume])
+
+    ws.clear()
+    ws.update(f"A1:H{len(new_rows)}", new_rows)
 
 
 def _to_applied_date(ts: str) -> str:
@@ -112,6 +143,7 @@ def get_all_jobs() -> list[dict]:
             "url":         job_url,
             "status":      row[COL_STATUS].strip(),
             "timestamp":   _to_applied_date(row[COL_APPLIED_DATE].strip() if len(row) > COL_APPLIED_DATE else ""),
+            "li_url":      _col(row, COL_LI_URL, legacy),
             "resume_link": _col(row, COL_RESUME_LINK, legacy),
         })
     return results
@@ -236,6 +268,36 @@ def mark_no_resume(row_index: int):
 def mark_already_messaged(row_index: int):
     ws = _worksheet()
     ws.update_cell(row_index, COL_STATUS + 1, STATUS_ALREADY_MESSAGED)
+
+
+# ─── Sent Messages ───────────────────────────────────────────────────────────
+# Separate sheet: people we've already messaged (LinkedIn ID + Company).
+# Multiple people from same company allowed.
+
+SENT_HEADERS = ["Name", "LinkedIn ID", "Company"]
+
+
+def _sent_worksheet():
+    """Get or create the Sent Messages worksheet."""
+    spreadsheet = _client().open_by_key(SHEET_ID)
+    try:
+        return spreadsheet.worksheet(SENT_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=SENT_TAB, rows=5000, cols=3)
+
+
+def add_to_sent_sheet(li_name: str, li_url: str, company: str):
+    """Append a row to Sent Messages when we successfully send a DM."""
+    ws = _sent_worksheet()
+    rows = ws.get_all_values()
+    if not rows:
+        ws.update("A1:C1", [SENT_HEADERS])
+        rows = [SENT_HEADERS]
+    # Avoid duplicate: same person + company already recorded
+    for row in rows[1:]:
+        if len(row) >= 3 and row[1].strip() == li_url.strip() and row[2].strip() == company.strip():
+            return
+    ws.append_row([li_name or "", li_url or "", company or ""])
 
 
 # ─── Snapshot ─────────────────────────────────────────────────────────────────

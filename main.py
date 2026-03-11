@@ -25,6 +25,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from playwright.async_api import async_playwright
 
 import sheets
+from sheets import STATUS_APPLIED
 import drive
 import linkedin as li
 import matcher as m
@@ -51,6 +52,13 @@ async def poll_connections():
     company row in the sheet.
     """
     logger.info("=== poll_connections started ===")
+
+    # Refine tracker: timestamp→date, remove Source, add headers (cleans extension data)
+    try:
+        sheets.refine_tracker_sheet()
+        logger.info("Tracker sheet refined (date format, no Source, headers)")
+    except Exception as e:
+        logger.warning("Could not refine tracker: %s", e)
 
     async with async_playwright() as p:
         browser, context = await li.make_browser_context(p)
@@ -211,21 +219,34 @@ async def poll_connections():
                         matched = m.find_matching_row(company_hint, all_jobs)
 
                     if matched:
-                        logger.info(
-                            "Multi-referral: %s → %s @ %s (job status: %s)",
-                            conn["name"], matched["role"], matched["company"],
-                            matched.get("status", "?"),
-                        )
-                        sheets.add_pending_row(
-                            timestamp=matched.get("timestamp", ""),
-                            company=matched["company"],
-                            role=matched["role"],
-                            job_url=matched.get("url", ""),
-                            source=matched.get("source", ""),
-                            li_name=conn["name"],
-                            li_url=li_url,
-                        )
-                        tracked_urls.add(li_url)  # prevent duplicate within this poll
+                        # Update existing row if it has no person yet (avoid duplicate like HAVI)
+                        if not matched.get("li_url") and matched.get("status") == STATUS_APPLIED:
+                            logger.info(
+                                "Multi-referral: %s → %s @ %s (updating Applied row)",
+                                conn["name"], matched["role"], matched["company"],
+                            )
+                            sheets.mark_pending(
+                                row_index=matched["row_index"],
+                                li_name=conn["name"],
+                                li_url=li_url,
+                            )
+                        else:
+                            # Second+ person at same company — add new row
+                            logger.info(
+                                "Multi-referral: %s → %s @ %s (adding row, job status: %s)",
+                                conn["name"], matched["role"], matched["company"],
+                                matched.get("status", "?"),
+                            )
+                            sheets.add_pending_row(
+                                timestamp=matched.get("timestamp", ""),
+                                company=matched["company"],
+                                role=matched["role"],
+                                job_url=matched.get("url", ""),
+                                source="",
+                                li_name=conn["name"],
+                                li_url=li_url,
+                            )
+                        tracked_urls.add(li_url)
                         new_referrals += 1
 
             if new_referrals:
@@ -319,6 +340,7 @@ async def send_messages():
                 # Step 7: log result back to sheet
                 if success:
                     sheets.mark_sent(row["row_index"])
+                    sheets.add_to_sent_sheet(li_name, profile_url, company)
                 else:
                     # Leave as Pending — will retry next send window
                     logger.warning("Failed to send to %s, will retry next run.", li_name)
