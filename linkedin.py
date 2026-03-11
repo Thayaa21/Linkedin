@@ -606,6 +606,8 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             logger.warning("No Message button found on %s", profile_url)
             return False
 
+        await msg_btn.evaluate("el => el.scrollIntoView({block: 'center'})")
+        await _pause(0.3, 0.5)
         # Use JS click to bypass any remaining overlay issues
         await msg_btn.evaluate("el => el.click()")
         await _pause(3, 5)  # Panel animates in — wait for it
@@ -642,6 +644,8 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             logger.warning("Message composer not found for %s", profile_url)
             return False
 
+        await composer.evaluate("el => el.scrollIntoView({block: 'center'})")
+        await _pause(0.3, 0.5)
         await composer.click(force=True)
         await _pause(0.5, 1)
 
@@ -670,6 +674,8 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             logger.warning("Send button not found for %s", profile_url)
             return False
 
+        await send_btn.evaluate("el => el.scrollIntoView({block: 'center'})")
+        await _pause(0.3, 0.5)
         await send_btn.click(force=True)
         await _pause(2, 3)
         logger.info("Message sent to %s", profile_url)
