@@ -285,7 +285,11 @@ async def get_connections(page: Page) -> dict[str, dict]:
         try:
             name = f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip()
             identifier = profile.get("publicIdentifier", "")
-            if not name or not identifier:
+            if not identifier:
+                continue
+            # Reject invalid names (API glitch, wrong data) — avoid writing "dom" etc to sheet
+            if not name or len(name) < 4 or name.lower() in ("dom", "nil", "null", "undefined"):
+                logger.warning("Skipping profile %s: invalid name '%s'", identifier, name)
                 continue
 
             url = f"{LINKEDIN_BASE}/in/{identifier}"
