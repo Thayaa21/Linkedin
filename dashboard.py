@@ -120,28 +120,28 @@ if GH_TOKEN and GH_REPO:
 
 # ── Per-status sections ────────────────────────────────────────────────────────
 st.subheader("Pending — waiting to send DM")
-pending = df[df["Status"] == "Pending Message"][["Company", "Role", "LI Name", "LI URL", "Timestamp"]]
+pending = df[df["Status"] == "Pending Message"][["Company", "Role", "LI Name", "LI URL", "Applied Date"]]
 if pending.empty:
     st.info("No rows pending.")
 else:
     st.dataframe(pending, use_container_width=True, hide_index=True)
 
 st.subheader("Sent")
-sent = df[df["Status"] == "Message Sent"][["Company", "Role", "LI Name", "LI URL", "Timestamp"]]
+sent = df[df["Status"] == "Message Sent"][["Company", "Role", "LI Name", "LI URL", "Applied Date"]]
 if sent.empty:
     st.info("No messages sent yet.")
 else:
     st.dataframe(sent, use_container_width=True, hide_index=True)
 
 st.subheader("Applied — waiting for a connection")
-applied = df[df["Status"] == "Applied"][["Company", "Role", "Job URL", "Timestamp"]]
+applied = df[df["Status"] == "Applied"][["Company", "Role", "Job URL", "Applied Date"]]
 if applied.empty:
     st.info("No applied rows.")
 else:
     st.dataframe(applied, use_container_width=True, hide_index=True)
 
 st.subheader("No Resume / Issues")
-issues = df[df["Status"].isin(["No Resume", "Already Messaged"])][["Company", "Role", "Status", "Timestamp"]]
+issues = df[df["Status"].isin(["No Resume", "Already Messaged"])][["Company", "Role", "Status", "Applied Date"]]
 if issues.empty:
     st.info("No issues.")
 else:
