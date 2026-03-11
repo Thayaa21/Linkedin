@@ -59,6 +59,14 @@ async def poll_connections():
     except Exception as e:
         logger.warning("Could not ensure Sent sheet: %s", e)
 
+    # Remove duplicate rows (e.g. same person twice — keep Message Sent)
+    try:
+        n = sheets.deduplicate_sent_sheet()
+        if n:
+            logger.info("Deduplicated Sent sheet: removed %d duplicate row(s)", n)
+    except Exception as e:
+        logger.warning("Could not deduplicate Sent sheet: %s", e)
+
     # Refine tracker: timestamp→date, 5 cols only (no Name, LI, Resume)
     try:
         sheets.refine_tracker_sheet()
@@ -158,7 +166,8 @@ async def poll_connections():
             if all_jobs:
                 for conn in current.values():
                     li_url = conn["url"]
-                    if li_url in tracked_urls:
+                    li_norm = sheets.normalize_li_url(li_url)
+                    if li_norm in tracked_urls:
                         continue
 
                     company      = conn.get("current_company", "")
@@ -182,7 +191,7 @@ async def poll_connections():
                             role=matched["role"],
                             job_url=matched.get("url", ""),
                         )
-                        tracked_urls.add(li_url)
+                        tracked_urls.add(li_norm)
                         new_referrals += 1
 
             if new_referrals:
@@ -231,12 +240,19 @@ async def send_messages():
                 logger.error("LinkedIn session expired. Re-run save_cookies.py.")
                 return
 
+            already_sent = sheets.get_sent_li_urls()
             for row in pending:
                 profile_url = row["li_url"]
                 company     = row["company"]
                 role        = row["role"]
                 li_name     = row["li_name"]
                 first_name  = li_name.split()[0] if li_name else "there"
+
+                # Never send to someone we've already messaged (duplicate row guard)
+                if sheets.normalize_li_url(profile_url) in already_sent:
+                    logger.info("Skipping %s — already sent (duplicate row), marking as Message Sent", li_name)
+                    sheets.mark_sent_in_sent_sheet(row["row_index"])
+                    continue
 
                 resume_link = drive.get_resume_link(company)
                 if not resume_link:
@@ -255,6 +271,7 @@ async def send_messages():
 
                 if success:
                     sheets.mark_sent_in_sent_sheet(row["row_index"])
+                    already_sent.add(sheets.normalize_li_url(profile_url))
                 else:
                     logger.warning("Failed to send to %s, will retry next run.", li_name)
 

@@ -62,7 +62,7 @@ def _to_applied_date(ts: str) -> str:
 
 
 def ensure_sent_sheet_exists():
-    """Create Sent Messages sheet with headers if it doesn't exist."""
+    """Create Sent Messages sheet with header row (title) if it doesn't exist."""
     spreadsheet = _client().open_by_key(SHEET_ID)
     try:
         ws = spreadsheet.worksheet(SENT_TAB)
@@ -71,6 +71,9 @@ def ensure_sent_sheet_exists():
     rows = ws.get_all_values()
     if not rows:
         ws.update("A1:F1", [SENT_HEADERS])
+    elif rows[0][0].strip() != "Name":
+        # First row is not our header — insert header row at top
+        ws.insert_row(SENT_HEADERS, 1)
 
 
 def _sent_worksheet():
@@ -170,6 +173,12 @@ def get_all_jobs() -> list[dict]:
     return results
 
 
+def normalize_li_url(url: str) -> str:
+    """Normalize LinkedIn URL for comparison (handles trailing slash, case)."""
+    u = (url or "").strip().lower().rstrip("/")
+    return u
+
+
 def get_tracked_li_urls() -> set[str]:
     """Returns all LinkedIn URLs in Sent sheet (Pending + Sent)."""
     try:
@@ -180,7 +189,22 @@ def get_tracked_li_urls() -> set[str]:
     urls = set()
     for row in records[1:]:
         if len(row) > SENT_COL_LI_URL and row[SENT_COL_LI_URL].strip():
-            urls.add(row[SENT_COL_LI_URL].strip())
+            urls.add(normalize_li_url(row[SENT_COL_LI_URL]))
+    return urls
+
+
+def get_sent_li_urls() -> set[str]:
+    """Returns LinkedIn URLs we've ALREADY sent a message to. Never send to these again."""
+    try:
+        ws = _sent_worksheet()
+    except gspread.exceptions.WorksheetNotFound:
+        return set()
+    records = ws.get_all_values()
+    urls = set()
+    for row in records[1:]:
+        if len(row) > SENT_COL_STATUS and row[SENT_COL_STATUS].strip() == STATUS_SENT:
+            if len(row) > SENT_COL_LI_URL and row[SENT_COL_LI_URL].strip():
+                urls.add(normalize_li_url(row[SENT_COL_LI_URL]))
     return urls
 
 
@@ -192,6 +216,12 @@ def add_pending_to_sent_sheet(
     job_url: str,
 ):
     """Add a row to Sent sheet with Status=Pending (when we match a connection)."""
+    if not li_url or not li_url.strip():
+        return
+    li_norm = normalize_li_url(li_url)
+    # Never add if we've already sent to this person
+    if li_norm in get_sent_li_urls():
+        return
     ensure_sent_sheet_exists()
     ws = _sent_worksheet()
     rows = ws.get_all_values()
@@ -199,8 +229,9 @@ def add_pending_to_sent_sheet(
         ws.update("A1:F1", [SENT_HEADERS])
         rows = [SENT_HEADERS]
     for row in rows[1:]:
-        if len(row) > SENT_COL_LI_URL and row[SENT_COL_LI_URL].strip() == li_url.strip() and (row[SENT_COL_COMPANY].strip() if len(row) > SENT_COL_COMPANY else "") == company.strip():
-            return  # already recorded
+        if len(row) > SENT_COL_LI_URL and row[SENT_COL_LI_URL].strip():
+            if normalize_li_url(row[SENT_COL_LI_URL]) == li_norm and (row[SENT_COL_COMPANY].strip() if len(row) > SENT_COL_COMPANY else "") == company.strip():
+                return  # already recorded (same person + company)
     ws.append_row([li_name or "", company or "", li_url or "", job_url or "", role or "", STATUS_PENDING])
 
 
@@ -238,6 +269,104 @@ def mark_no_resume_in_sent_sheet(row_index: int):
     """Update Sent sheet row to Status=No Resume (skip sending)."""
     ws = _sent_worksheet()
     ws.update_cell(row_index, SENT_COL_STATUS + 1, STATUS_NO_RESUME)
+
+
+def mark_person_as_sent(li_url: str | None = None, name: str | None = None) -> bool:
+    """
+    Mark a person as Message Sent by LinkedIn URL or name (for fixing wrong status).
+    Returns True if updated, False if not found.
+    """
+    if not li_url and not name:
+        return False
+    try:
+        ws = _sent_worksheet()
+    except gspread.exceptions.WorksheetNotFound:
+        return False
+    records = ws.get_all_values()
+    name_lower = name.lower().strip() if name else ""
+    li_url_norm = li_url.strip() if li_url else ""
+    for i, row in enumerate(records[1:], start=2):
+        if len(row) <= SENT_COL_STATUS:
+            continue
+        if row[SENT_COL_STATUS].strip() == STATUS_SENT:
+            continue
+        match_url = li_url_norm and len(row) > SENT_COL_LI_URL and row[SENT_COL_LI_URL].strip() and li_url_norm in row[SENT_COL_LI_URL].strip()
+        match_name = name_lower and len(row) > SENT_COL_NAME and row[SENT_COL_NAME].strip() and name_lower in row[SENT_COL_NAME].strip().lower()
+        if match_url or match_name:
+            ws.update_cell(i, SENT_COL_STATUS + 1, STATUS_SENT)
+            return True
+    return False
+
+
+def deduplicate_sent_sheet() -> int:
+    """
+    Remove duplicate rows: same (li_url, company). Keep Message Sent over Pending.
+    Returns number of duplicate rows removed.
+    """
+    try:
+        ws = _sent_worksheet()
+    except gspread.exceptions.WorksheetNotFound:
+        return 0
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return 0
+    header = rows[0]
+    seen: dict[tuple[str, str], tuple[int, list]] = {}  # (li_norm, company) -> (row_index, row)
+    to_delete: list[int] = []
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) <= SENT_COL_LI_URL:
+            continue
+        li_url = row[SENT_COL_LI_URL].strip() if len(row) > SENT_COL_LI_URL else ""
+        company = row[SENT_COL_COMPANY].strip() if len(row) > SENT_COL_COMPANY else ""
+        status = row[SENT_COL_STATUS].strip() if len(row) > SENT_COL_STATUS else ""
+        if not li_url:
+            continue
+        key = (normalize_li_url(li_url), company)
+        if key in seen:
+            prev_idx, prev_row = seen[key]
+            prev_status = prev_row[SENT_COL_STATUS].strip() if len(prev_row) > SENT_COL_STATUS else ""
+            # Keep Message Sent; delete the other. If both same, keep first, delete this.
+            if status == STATUS_SENT and prev_status != STATUS_SENT:
+                to_delete.append(prev_idx)
+                seen[key] = (i, row)
+            else:
+                to_delete.append(i)
+        else:
+            seen[key] = (i, row)
+    for row_idx in sorted(to_delete, reverse=True):
+        ws.delete_rows(row_idx)
+    return len(to_delete)
+
+
+def sync_sent_from_tracker():
+    """
+    When Tracker has Message Sent for a company but Sent sheet has Pending for that company,
+    and there's exactly one Pending row for that company — update it to Message Sent.
+    Handles migration mismatch (sent before refactor).
+    """
+    try:
+        tracker_ws = _worksheet()
+        sent_ws = _sent_worksheet()
+    except gspread.exceptions.WorksheetNotFound:
+        return 0
+    tracker_rows = tracker_ws.get_all_values()
+    sent_rows = sent_ws.get_all_values()
+    if len(tracker_rows) < 2 or len(sent_rows) < 2:
+        return 0
+    sent_companies = {r[COL_COMPANY].strip() for i, r in enumerate(tracker_rows[1:]) if len(r) > COL_STATUS and r[COL_STATUS].strip() == STATUS_SENT}
+    updated = 0
+    for company in sent_companies:
+        pending_for_company = [
+            (i, r) for i, r in enumerate(sent_rows[1:], start=2)
+            if len(r) > SENT_COL_STATUS
+            and (r[SENT_COL_COMPANY].strip() if len(r) > SENT_COL_COMPANY else "") == company
+            and r[SENT_COL_STATUS].strip() == STATUS_PENDING
+        ]
+        if len(pending_for_company) == 1:
+            row_idx, _ = pending_for_company[0]
+            sent_ws.update_cell(row_idx, SENT_COL_STATUS + 1, STATUS_SENT)
+            updated += 1
+    return updated
 
 
 # ─── Snapshot ─────────────────────────────────────────────────────────────────

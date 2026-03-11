@@ -111,60 +111,87 @@ if df_tracker.empty and df_sent.empty:
     st.stop()
 
 # ── Stats row ──────────────────────────────────────────────────────────────────
+# Applied: Tracker only. Pending/Sent: Sent sheet (people); fallback to Tracker during migration
 tracker_counts = df_tracker["Status"].value_counts().to_dict() if not df_tracker.empty else {}
 sent_counts = df_sent["Status"].value_counts().to_dict() if not df_sent.empty else {}
 
+pending_count = sent_counts.get("Pending Message", 0) or tracker_counts.get("Pending Message", 0)
+sent_count = sent_counts.get("Message Sent", 0) or tracker_counts.get("Message Sent", 0)
+
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("📋 Applied", tracker_counts.get("Applied", 0))
-col2.metric("⏳ Pending Message", sent_counts.get("Pending Message", 0))
-col3.metric("✅ Message Sent", sent_counts.get("Message Sent", 0))
-col4.metric("❌ No Resume", sent_counts.get("No Resume", 0))
+col2.metric("⏳ Pending Message", pending_count)
+col3.metric("✅ Message Sent", sent_count)
+col4.metric("❌ No Resume", sent_counts.get("No Resume", 0) or tracker_counts.get("No Resume", 0))
 col5.metric("💬 Already Messaged", tracker_counts.get("Already Messaged", 0) + sent_counts.get("Already Messaged", 0))
 
 st.divider()
 
 # ── Manual trigger buttons ─────────────────────────────────────────────────────
-if GH_TOKEN and GH_REPO:
-    st.subheader("Manual Controls")
-    c1, c2, _ = st.columns([1, 1, 6])
-    if c1.button("🔄 Run Poll Now"):
+st.subheader("Manual Controls")
+c1, c2, c3, _ = st.columns([1, 1, 1, 5])
+if c1.button("🔄 Run Poll Now"):
+    if GH_TOKEN and GH_REPO:
         ok, err = trigger_workflow("poll.yaml")
         if ok:
             st.success("Poll triggered!")
         else:
             st.error(f"Failed to trigger poll — {err}")
-    if c2.button("📨 Run Send Now"):
+    else:
+        st.error("GH_TOKEN or GH_REPO not set in .env")
+if c2.button("📨 Run Send Now"):
+    if GH_TOKEN and GH_REPO:
         ok, err = trigger_workflow("send.yaml")
         if ok:
             st.success("Send triggered!")
         else:
             st.error(f"Failed to trigger send — {err}")
-    st.divider()
+    else:
+        st.error("GH_TOKEN or GH_REPO not set in .env")
+if c3.button("🔄 Sync Sent from Tracker"):
+    import sheets
+    n = sheets.sync_sent_from_tracker()
+    st.success(f"Synced {n} row(s). Refresh the page to see updates.")
+if st.button("🧹 Deduplicate Sent Sheet"):
+    import sheets
+    n = sheets.deduplicate_sent_sheet()
+    st.success(f"Removed {n} duplicate row(s). Refresh the page to see updates.")
+st.divider()
 
 # ── Sent sheet: People we've messaged (main view) ────────────────────────────────
 st.subheader("📨 Sent Messages — People & Companies")
-if df_sent.empty:
-    st.info("No people in Sent sheet yet.")
-else:
+if not df_sent.empty:
     st.dataframe(
         df_sent[["Name", "Company", "LinkedIn ID", "Job URL", "Status"]],
         use_container_width=True,
         hide_index=True,
     )
+elif not df_tracker.empty and (tracker_counts.get("Pending Message", 0) or tracker_counts.get("Message Sent", 0)):
+    st.info("Person data is in Tracker. Run **Poll** or `python migrate_sheet.py` to migrate to Sent sheet.")
+else:
+    st.info("No people in Sent sheet yet.")
 
 st.subheader("Pending — waiting to send DM")
 pending = df_sent[df_sent["Status"] == "Pending Message"] if not df_sent.empty else pd.DataFrame()
-if pending.empty:
-    st.info("No rows pending.")
-else:
+pending_tracker = df_tracker[df_tracker["Status"] == "Pending Message"] if not df_tracker.empty else pd.DataFrame()
+if not pending.empty:
     st.dataframe(pending[["Name", "Company", "LinkedIn ID", "Job URL"]], use_container_width=True, hide_index=True)
+elif not pending_tracker.empty:
+    st.dataframe(pending_tracker[["Company", "Role", "Job URL", "Applied Date"]], use_container_width=True, hide_index=True)
+    st.caption("From Tracker. Run Poll or migrate_sheet.py to move to Sent sheet.")
+else:
+    st.info("No rows pending.")
 
 st.subheader("Sent")
 sent = df_sent[df_sent["Status"] == "Message Sent"] if not df_sent.empty else pd.DataFrame()
-if sent.empty:
-    st.info("No messages sent yet.")
-else:
+sent_tracker = df_tracker[df_tracker["Status"] == "Message Sent"] if not df_tracker.empty else pd.DataFrame()
+if not sent.empty:
     st.dataframe(sent[["Name", "Company", "LinkedIn ID", "Job URL"]], use_container_width=True, hide_index=True)
+elif not sent_tracker.empty:
+    st.dataframe(sent_tracker[["Company", "Role", "Job URL", "Applied Date"]], use_container_width=True, hide_index=True)
+    st.caption("From Tracker. Run Poll or migrate_sheet.py to move to Sent sheet.")
+else:
+    st.info("No messages sent yet.")
 
 # ── Tracker: Applications ──────────────────────────────────────────────────────
 st.subheader("📋 Tracker — Applications (Applied Date, Company, Role, Job URL, Status)")
