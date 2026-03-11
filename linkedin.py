@@ -546,6 +546,10 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
     try:
         # Longer timeout for typing long messages (default 30s can be too short)
         page.set_default_timeout(60000)
+        # Reset: go to feed first to close any open message panel from previous send
+        await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
+        await _pause(1, 2)
+        # Now open the target profile fresh
         await page.goto(profile_url, wait_until="domcontentloaded")
         await _pause(2, 4)
 
