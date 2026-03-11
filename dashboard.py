@@ -52,11 +52,14 @@ def load_sheet() -> pd.DataFrame:
     rows  = ws.get_all_values()
     if len(rows) < 2:
         return pd.DataFrame()
-    headers = ["Timestamp", "Company", "Role", "Job URL", "Status", "Source", "LI Name", "LI URL"]
+    headers = ["Applied Date", "Company", "Role", "Job URL", "Status", "LI Name", "LI URL", "Resume Link"]
     data = []
     for row in rows[1:]:
-        padded = row + [""] * (8 - len(row))
-        data.append(padded[:8])
+        # Support legacy (9 cols with Source) or new (8 cols)
+        if len(row) >= 9:
+            row = [row[0][:10] if row[0] else "", row[1], row[2], row[3], row[4], row[6], row[7], row[8] if len(row) > 8 else ""]
+        padded = (row + [""] * 8)[:8]
+        data.append(padded)
     return pd.DataFrame(data, columns=headers)
 
 

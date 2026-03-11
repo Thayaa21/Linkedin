@@ -68,6 +68,19 @@ All automated. Runs on GitHub Actions. No manual follow-ups.
 
 ---
 
+## Sheet Layout
+
+**Tracker (Applications):** Applied Date | Company | Role | Job URL | Status | LI Name | LI URL | Resume Link
+
+**Snapshot:** Profile URL | Name | Headline | Company
+
+If you have an existing sheet with the old format (Timestamp, Source), run:
+```bash
+python migrate_sheet.py
+```
+
+---
+
 ## Setup
 
 ### Prerequisites

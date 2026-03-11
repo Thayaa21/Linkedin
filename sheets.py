@@ -1,14 +1,14 @@
 """
 sheets.py — Google Sheets read/write via gspread (service account auth).
 
-Sheet columns (must match the Chrome extension output):
-  A: Timestamp  B: Company  C: Role  D: Job URL  E: Status  F: Source
+Tracker layout:
+  A: Applied Date  B: Company  C: Role  D: Job URL  E: Status  F: LI Name  G: LI URL  H: Resume Link
 
-Status lifecycle managed by this agent:
+Status lifecycle:
   Applied  →  Pending Message  →  Message Sent  |  No Resume  |  Already Messaged
 """
 
-import json as _json
+import re
 import gspread
 from google.oauth2.service_account import Credentials
 from config import SHEET_ID, SHEET_TAB, GOOGLE_CREDS_FILE
@@ -18,22 +18,26 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
-# Column indices (0-based)
-COL_TIMESTAMP   = 0
+# Column indices (0-based) — no Source column
+COL_APPLIED_DATE = 0
 COL_COMPANY     = 1
 COL_ROLE        = 2
 COL_URL         = 3
 COL_STATUS      = 4
-COL_SOURCE      = 5
-COL_LI_NAME     = 6   # added by agent when a match is found
-COL_LI_URL      = 7   # LinkedIn profile URL of matched connection
-COL_RESUME_LINK = 8   # Google Drive resume link (populated by poll)
+COL_LI_NAME     = 5
+COL_LI_URL      = 6
+COL_RESUME_LINK = 7
+
+# Legacy: old format had Source at 5, so LI Name=6, LI URL=7, Resume=8
+COL_SOURCE_LEGACY = 5  # skip when reading
 
 STATUS_APPLIED          = "Applied"
 STATUS_PENDING          = "Pending Message"
 STATUS_SENT             = "Message Sent"
 STATUS_NO_RESUME        = "No Resume"
 STATUS_ALREADY_MESSAGED = "Already Messaged"
+
+TRACKER_HEADERS = ["Applied Date", "Company", "Role", "Job URL", "Status", "LI Name", "LI URL", "Resume Link"]
 
 
 def _client():
@@ -45,40 +49,52 @@ def _worksheet():
     return _client().open_by_key(SHEET_ID).worksheet(SHEET_TAB)
 
 
+def _to_applied_date(ts: str) -> str:
+    """Extract YYYY-MM-DD from timestamp like 2026-03-10T07:..."""
+    if not ts:
+        return ""
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", ts.strip())
+    return m.group(1) if m else ts[:10] if len(ts) >= 10 else ts
+
+
+def _col(row: list, idx: int, legacy_offset: int = 0) -> str:
+    """Get column value; legacy sheets had Source at 5, shifting LI columns by 1."""
+    actual = idx + legacy_offset if legacy_offset and idx >= COL_LI_NAME else idx
+    return row[actual].strip() if len(row) > actual else ""
+
+
+def _is_legacy_format(row: list) -> bool:
+    """Old format had 9+ columns (with Source)."""
+    return len(row) >= 9
+
+
 # ─── Read ─────────────────────────────────────────────────────────────────────
 
 def get_applied_companies() -> list[dict]:
-    """
-    Returns all rows with Status == 'Applied'.
-    Each dict has keys: row_index, company, role, url, timestamp, resume_link
-    (row_index is 1-based, accounting for the header row)
-    """
+    """Returns rows with Status == 'Applied'."""
     ws = _worksheet()
     records = ws.get_all_values()
     results = []
-    for i, row in enumerate(records[1:], start=2):  # skip header, 1-based
+    for i, row in enumerate(records[1:], start=2):
         if len(row) < 5:
             continue
         status = row[COL_STATUS].strip()
-        if status == STATUS_APPLIED:
-            results.append({
-                "row_index":   i,
-                "company":     row[COL_COMPANY].strip(),
-                "role":        row[COL_ROLE].strip(),
-                "url":         row[COL_URL].strip(),
-                "timestamp":   row[COL_TIMESTAMP].strip(),
-                "source":      row[COL_SOURCE].strip() if len(row) > COL_SOURCE else "",
-                "resume_link": row[COL_RESUME_LINK].strip() if len(row) > COL_RESUME_LINK else "",
-            })
+        if status != STATUS_APPLIED:
+            continue
+        legacy = 1 if _is_legacy_format(row) else 0
+        results.append({
+            "row_index":   i,
+            "company":     row[COL_COMPANY].strip(),
+            "role":        row[COL_ROLE].strip(),
+            "url":         row[COL_URL].strip() if len(row) > COL_URL else "",
+            "timestamp":   _to_applied_date(row[COL_APPLIED_DATE].strip() if len(row) > COL_APPLIED_DATE else ""),
+            "resume_link": _col(row, COL_RESUME_LINK, legacy),
+        })
     return results
 
 
 def get_all_jobs() -> list[dict]:
-    """
-    Returns ALL rows that have a job URL — regardless of status.
-    Used for multi-referral matching: even if we already sent to one person
-    at Nokia, we still want to match and message a second Nokia connection.
-    """
+    """Returns ALL rows that have a job URL (for multi-referral matching)."""
     ws = _worksheet()
     records = ws.get_all_values()
     results = []
@@ -87,36 +103,30 @@ def get_all_jobs() -> list[dict]:
             continue
         job_url = row[COL_URL].strip() if len(row) > COL_URL else ""
         if not job_url:
-            continue  # rows added by add_pending_row have no job URL — skip
+            continue
+        legacy = 1 if _is_legacy_format(row) else 0
         results.append({
             "row_index":   i,
             "company":     row[COL_COMPANY].strip(),
             "role":        row[COL_ROLE].strip(),
             "url":         job_url,
             "status":      row[COL_STATUS].strip(),
-            "timestamp":   row[COL_TIMESTAMP].strip(),
-            "source":      row[COL_SOURCE].strip() if len(row) > COL_SOURCE else "",
-            "resume_link": row[COL_RESUME_LINK].strip() if len(row) > COL_RESUME_LINK else "",
+            "timestamp":   _to_applied_date(row[COL_APPLIED_DATE].strip() if len(row) > COL_APPLIED_DATE else ""),
+            "resume_link": _col(row, COL_RESUME_LINK, legacy),
         })
     return results
 
 
 def get_tracked_li_urls() -> set[str]:
-    """
-    Returns the set of ALL LinkedIn profile URLs already in the sheet
-    (any status: Pending, Sent, No Resume, etc.).
-
-    Used to avoid creating duplicate pending entries for someone we're
-    already planning to message — or have already messaged.
-    """
+    """Returns all LinkedIn profile URLs already in the sheet."""
     ws = _worksheet()
     records = ws.get_all_values()
-    urls: set[str] = set()
+    urls = set()
     for row in records[1:]:
-        if len(row) > COL_LI_URL:
-            url = row[COL_LI_URL].strip()
-            if url:
-                urls.add(url)
+        legacy = 1 if _is_legacy_format(row) else 0
+        url = _col(row, COL_LI_URL, legacy)
+        if url:
+            urls.add(url)
     return urls
 
 
@@ -125,34 +135,26 @@ def add_pending_row(
     company: str,
     role: str,
     job_url: str,
-    source: str,
+    source: str,  # kept for API compat, ignored
     li_name: str,
     li_url: str,
 ):
-    """
-    Appends a NEW 'Pending Message' row for an additional connection at a
-    company we've already applied to.  The original application row is left
-    unchanged — this is a second (or third…) referral request for the same job.
-    """
+    """Appends a new Pending Message row."""
     ws = _worksheet()
     ws.append_row([
-        timestamp,    # A — reuse original application timestamp
-        company,      # B
-        role,         # C
-        job_url,      # D — keep the job URL so resume lookup works
-        STATUS_PENDING,  # E
-        source,       # F
-        li_name,      # G
-        li_url,       # H
-        "",           # I — resume_link filled later by poll
+        _to_applied_date(timestamp),
+        company,
+        role,
+        job_url,
+        STATUS_PENDING,
+        li_name,
+        li_url,
+        "",
     ])
 
 
 def get_rows_needing_resume() -> list[dict]:
-    """
-    Returns all rows (Applied or Pending) that need a resume link from Drive.
-    Used by poll to fetch and store resume links in the sheet.
-    """
+    """Returns rows (Applied or Pending) that need a resume link from Drive."""
     ws = _worksheet()
     records = ws.get_all_values()
     results = []
@@ -162,9 +164,10 @@ def get_rows_needing_resume() -> list[dict]:
         status = row[COL_STATUS].strip()
         if status not in (STATUS_APPLIED, STATUS_PENDING):
             continue
-        resume = row[COL_RESUME_LINK].strip() if len(row) > COL_RESUME_LINK else ""
+        legacy = 1 if _is_legacy_format(row) else 0
+        resume = _col(row, COL_RESUME_LINK, legacy)
         if resume:
-            continue  # already has resume
+            continue
         results.append({
             "row_index":   i,
             "company":     row[COL_COMPANY].strip(),
@@ -175,42 +178,49 @@ def get_rows_needing_resume() -> list[dict]:
 
 
 def get_pending_rows() -> list[dict]:
-    """Returns rows with Status == 'Pending Message' (ready to send DM)."""
+    """Returns rows with Status == 'Pending Message'."""
     ws = _worksheet()
     records = ws.get_all_values()
     results = []
     for i, row in enumerate(records[1:], start=2):
-        if len(row) < 8:
+        if len(row) < 5:
             continue
-        if row[COL_STATUS].strip() == STATUS_PENDING:
-            results.append({
-                "row_index":   i,
-                "company":     row[COL_COMPANY].strip(),
-                "role":        row[COL_ROLE].strip(),
-                "li_name":     row[COL_LI_NAME].strip() if len(row) > COL_LI_NAME else "",
-                "li_url":      row[COL_LI_URL].strip()  if len(row) > COL_LI_URL  else "",
-                "resume_link": row[COL_RESUME_LINK].strip() if len(row) > COL_RESUME_LINK else "",
-            })
+        if row[COL_STATUS].strip() != STATUS_PENDING:
+            continue
+        legacy = 1 if _is_legacy_format(row) else 0
+        results.append({
+            "row_index":   i,
+            "company":     row[COL_COMPANY].strip(),
+            "role":        row[COL_ROLE].strip(),
+            "li_name":     _col(row, COL_LI_NAME, legacy),
+            "li_url":      _col(row, COL_LI_URL, legacy),
+            "resume_link": _col(row, COL_RESUME_LINK, legacy),
+        })
     return results
 
 
 # ─── Write ────────────────────────────────────────────────────────────────────
 
 def store_resume_link(row_index: int, link: str):
-    """Store the Drive resume link in column I for a given row."""
+    """Store the Drive resume link. Column H (8) for new layout, I (9) for legacy."""
     ws = _worksheet()
-    ws.update_cell(row_index, COL_RESUME_LINK + 1, link)
+    col = 9 if _row_is_legacy(ws, row_index) else 8
+    ws.update_cell(row_index, col, link)
+
+
+def _row_is_legacy(ws, row_index: int) -> bool:
+    row = ws.row_values(row_index)
+    return len(row) >= 9
 
 
 def mark_pending(row_index: int, li_name: str, li_url: str, source: str = ""):
-    """Connection accepted — mark row as Pending Message + store LinkedIn info."""
+    """Mark row as Pending Message + store LinkedIn info."""
     ws = _worksheet()
-    ws.update(f"E{row_index}:H{row_index}", [[
-        STATUS_PENDING,
-        source,      # F (source) — preserve existing
-        li_name,     # G
-        li_url,      # H
-    ]])
+    legacy = _row_is_legacy(ws, row_index)
+    if legacy:
+        ws.update(f"E{row_index}:H{row_index}", [[STATUS_PENDING, source or "", li_name, li_url]])
+    else:
+        ws.update(f"E{row_index}:G{row_index}", [[STATUS_PENDING, li_name, li_url]])
 
 
 def mark_sent(row_index: int):
@@ -228,59 +238,61 @@ def mark_already_messaged(row_index: int):
     ws.update_cell(row_index, COL_STATUS + 1, STATUS_ALREADY_MESSAGED)
 
 
-# ─── Snapshot persistence ─────────────────────────────────────────────────────
-# Stored in a separate "Snapshot" tab so it survives GitHub Actions runs.
-# Columns: A=profile_url  B=json_blob (name, headline, current_company)
+# ─── Snapshot ─────────────────────────────────────────────────────────────────
+# Columns: A=Profile URL  B=Name  C=Headline  D=Company
 
 SNAPSHOT_TAB = "Snapshot"
+SNAPSHOT_HEADERS = ["Profile URL", "Name", "Headline", "Company"]
 
 
 def load_snapshot_from_sheet() -> dict[str, dict]:
-    """
-    Load the connections snapshot from the Snapshot sheet tab.
-    Returns {} if the tab doesn't exist yet (first run).
-    """
+    """Load connections snapshot. Supports both old (JSON) and new (columns) format."""
     try:
         ws = _client().open_by_key(SHEET_ID).worksheet(SNAPSHOT_TAB)
         rows = ws.get_all_values()
         result = {}
         for row in rows:
-            if not row or not row[0]:
+            if not row or not row[0].strip():
                 continue
             url = row[0].strip()
-            try:
-                data = _json.loads(row[1]) if len(row) > 1 and row[1] else {}
-            except Exception:
-                data = {}
-            data.setdefault("url", url)
-            result[url] = data
+            # New format: A=URL, B=Name, C=Headline, D=Company
+            if len(row) >= 4:
+                result[url] = {
+                    "url": url,
+                    "name": row[1].strip() if len(row) > 1 else "",
+                    "headline": row[2].strip() if len(row) > 2 else "",
+                    "current_company": row[3].strip() if len(row) > 3 else "",
+                }
+            else:
+                # Legacy: B was JSON blob
+                import json as _json
+                try:
+                    data = _json.loads(row[1]) if len(row) > 1 and row[1] else {}
+                except Exception:
+                    data = {}
+                data.setdefault("url", url)
+                result[url] = data
         return result
     except gspread.exceptions.WorksheetNotFound:
         return {}
 
 
 def save_snapshot_to_sheet(connections: dict[str, dict]):
-    """
-    Persist the full connections snapshot to the Snapshot sheet tab.
-    Creates the tab automatically on first run.
-    """
+    """Persist snapshot with clean columns: URL, Name, Headline, Company."""
     spreadsheet = _client().open_by_key(SHEET_ID)
     try:
         ws = spreadsheet.worksheet(SNAPSHOT_TAB)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=SNAPSHOT_TAB, rows=5000, cols=2)
+        ws = spreadsheet.add_worksheet(title=SNAPSHOT_TAB, rows=5000, cols=4)
 
     ws.clear()
     if connections:
-        rows = [
-            [
+        rows = [[SNAPSHOT_HEADERS[0], SNAPSHOT_HEADERS[1], SNAPSHOT_HEADERS[2], SNAPSHOT_HEADERS[3]]]
+        for url, d in connections.items():
+            rows.append([
                 url,
-                _json.dumps({
-                    "name":            d.get("name", ""),
-                    "headline":        d.get("headline", ""),
-                    "current_company": d.get("current_company", ""),
-                }),
-            ]
-            for url, d in connections.items()
-        ]
-        ws.update(f"A1:B{len(rows)}", rows)
+                d.get("name", ""),
+                d.get("headline", ""),
+                d.get("current_company", ""),
+            ])
+        ws.update(f"A1:D{len(rows)}", rows)
