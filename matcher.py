@@ -58,6 +58,14 @@ def find_matching_row(
     if not connection_company or not sheet_rows:
         return None
 
+    conn_lower = connection_company.strip().lower()
+
+    # Fast path: case-insensitive exact match (e.g. "Havi" vs "HAVI")
+    for row in sheet_rows:
+        if row["company"].strip().lower() == conn_lower:
+            logger.info("Matched '%s' → '%s' (exact)", connection_company, row["company"])
+            return row
+
     # Build lookup: normalised company name → row
     choices = {row["company"]: row for row in sheet_rows}
 

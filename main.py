@@ -163,6 +163,7 @@ async def poll_connections():
                                 row_index=row_index,
                                 li_name=conn["name"],
                                 li_url=conn["url"],
+                                source=matched_row.get("source", ""),
                             )
                             rows_with_person.add(row_index)
                     else:

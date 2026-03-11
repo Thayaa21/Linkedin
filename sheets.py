@@ -67,6 +67,7 @@ def get_applied_companies() -> list[dict]:
                 "role":        row[COL_ROLE].strip(),
                 "url":         row[COL_URL].strip(),
                 "timestamp":   row[COL_TIMESTAMP].strip(),
+                "source":      row[COL_SOURCE].strip() if len(row) > COL_SOURCE else "",
                 "resume_link": row[COL_RESUME_LINK].strip() if len(row) > COL_RESUME_LINK else "",
             })
     return results
@@ -201,12 +202,12 @@ def store_resume_link(row_index: int, link: str):
     ws.update_cell(row_index, COL_RESUME_LINK + 1, link)
 
 
-def mark_pending(row_index: int, li_name: str, li_url: str):
+def mark_pending(row_index: int, li_name: str, li_url: str, source: str = ""):
     """Connection accepted — mark row as Pending Message + store LinkedIn info."""
     ws = _worksheet()
     ws.update(f"E{row_index}:H{row_index}", [[
         STATUS_PENDING,
-        "",          # F (source) — leave as-is
+        source,      # F (source) — preserve existing
         li_name,     # G
         li_url,      # H
     ]])
