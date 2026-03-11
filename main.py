@@ -249,6 +249,7 @@ async def send_messages():
                 if sheets.normalize_li_url(profile_url) in already_sent:
                     logger.info("Skipping %s — already sent (duplicate row), marking as Message Sent", li_name)
                     sheets.mark_sent_in_sent_sheet(row["row_index"])
+                    sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
                     continue
 
                 resume_link = drive.get_resume_link(company)
@@ -268,6 +269,7 @@ async def send_messages():
                     success = await li.send_message(page, profile_url, message)
                     if success:
                         sheets.mark_sent_in_sent_sheet(row["row_index"])
+                        sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
                         already_sent.add(sheets.normalize_li_url(profile_url))
                         logger.info("Sent %d/%d: %s", i + 1, len(pending), li_name)
                     else:

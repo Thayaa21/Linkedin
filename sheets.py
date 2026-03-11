@@ -265,6 +265,23 @@ def mark_sent_in_sent_sheet(row_index: int):
     ws.update_cell(row_index, SENT_COL_STATUS + 1, STATUS_SENT)
 
 
+def update_tracker_status_for_company(company: str, new_status: str):
+    """Update Tracker row(s) for this company to new_status (e.g. Message Sent)."""
+    if not company or not company.strip():
+        return
+    try:
+        ws = _worksheet()
+    except gspread.exceptions.WorksheetNotFound:
+        return
+    records = ws.get_all_values()
+    for i, row in enumerate(records[1:], start=2):
+        if len(row) <= COL_STATUS:
+            continue
+        row_company = row[COL_COMPANY].strip() if len(row) > COL_COMPANY else ""
+        if row_company.lower() == company.strip().lower():
+            ws.update_cell(i, COL_STATUS + 1, new_status)
+
+
 def mark_no_resume_in_sent_sheet(row_index: int):
     """Update Sent sheet row to Status=No Resume (skip sending)."""
     ws = _sent_worksheet()
@@ -336,6 +353,39 @@ def deduplicate_sent_sheet() -> int:
     for row_idx in sorted(to_delete, reverse=True):
         ws.delete_rows(row_idx)
     return len(to_delete)
+
+
+def sync_tracker_from_sent():
+    """
+    Update Tracker: for each company in Sent sheet with Message Sent, set Tracker row(s) to Message Sent.
+    Fixes stale Tracker when messages were sent but Tracker wasn't updated.
+    """
+    try:
+        sent_ws = _sent_worksheet()
+        tracker_ws = _worksheet()
+    except gspread.exceptions.WorksheetNotFound:
+        return 0
+    sent_rows = sent_ws.get_all_values()
+    if len(sent_rows) < 2:
+        return 0
+    companies_sent = set()
+    for row in sent_rows[1:]:
+        if len(row) > SENT_COL_STATUS and row[SENT_COL_STATUS].strip() == STATUS_SENT:
+            company = row[SENT_COL_COMPANY].strip() if len(row) > SENT_COL_COMPANY else ""
+            if company:
+                companies_sent.add(company)
+    updated = 0
+    tracker_rows = tracker_ws.get_all_values()
+    for i, row in enumerate(tracker_rows[1:], start=2):
+        if len(row) <= COL_STATUS:
+            continue
+        row_company = row[COL_COMPANY].strip() if len(row) > COL_COMPANY else ""
+        row_status = row[COL_STATUS].strip()
+        if row_company and row_status in (STATUS_APPLIED, STATUS_PENDING):
+            if any(row_company.lower() == c.lower() for c in companies_sent):
+                tracker_ws.update_cell(i, COL_STATUS + 1, STATUS_SENT)
+                updated += 1
+    return updated
 
 
 def sync_sent_from_tracker():

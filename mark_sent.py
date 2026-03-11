@@ -7,7 +7,8 @@ Usage:
     python mark_sent.py "Juhyung Lee"
     python mark_sent.py "leejuhyung"
     python mark_sent.py --sync         # Sync from Tracker (companies with Message Sent)
-    python mark_sent.py --deduplicate # Remove duplicate rows (same person+company)
+    python mark_sent.py --deduplicate   # Remove duplicate rows (same person+company)
+    python mark_sent.py --sync-tracker  # Update Tracker to Message Sent for companies we've messaged
 """
 
 import sys
@@ -15,7 +16,7 @@ import sheets
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python mark_sent.py \"Name\" or \"linkedin_id\" or --sync or --deduplicate")
+        print("Usage: python mark_sent.py \"Name\" or \"linkedin_id\" or --sync or --deduplicate or --sync-tracker")
         sys.exit(1)
 
     arg = sys.argv[1].strip()
@@ -28,6 +29,11 @@ def main():
     if arg == "--deduplicate":
         n = sheets.deduplicate_sent_sheet()
         print(f"Removed {n} duplicate row(s) from Sent sheet.")
+        sys.exit(0)
+
+    if arg == "--sync-tracker":
+        n = sheets.sync_tracker_from_sent()
+        print(f"Updated {n} Tracker row(s) to Message Sent.")
         sys.exit(0)
 
     # Try as name or LinkedIn URL fragment

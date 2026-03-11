@@ -44,7 +44,7 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "")
 GH_REPO  = os.environ.get("GH_REPO", "")
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=30)
 def load_tracker() -> pd.DataFrame:
     """Load Tracker sheet (5 columns)."""
     creds = Credentials.from_service_account_file(GOOGLE_CREDS, scopes=SCOPES)
@@ -64,7 +64,7 @@ def load_tracker() -> pd.DataFrame:
     return pd.DataFrame(data, columns=headers)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=30)
 def load_sent() -> pd.DataFrame:
     """Load Sent Messages sheet (Name, Company, LinkedIn ID, Job URL, Role, Status)."""
     creds = Credentials.from_service_account_file(GOOGLE_CREDS, scopes=SCOPES)
@@ -155,7 +155,16 @@ if c3.button("🔄 Sync Sent from Tracker"):
 if st.button("🧹 Deduplicate Sent Sheet"):
     import sheets
     n = sheets.deduplicate_sent_sheet()
-    st.success(f"Removed {n} duplicate row(s). Refresh the page to see updates.")
+    load_sent.clear()
+    st.success(f"Removed {n} duplicate row(s). Refreshing...")
+    st.rerun()
+if st.button("🔄 Sync Tracker from Sent"):
+    import sheets
+    n = sheets.sync_tracker_from_sent()
+    load_tracker.clear()
+    load_sent.clear()
+    st.success(f"Updated {n} Tracker row(s) to Message Sent. Refreshing...")
+    st.rerun()
 st.divider()
 
 # ── Sent sheet: People we've messaged (main view) ────────────────────────────────
@@ -178,7 +187,7 @@ if not pending.empty:
     st.dataframe(pending[["Name", "Company", "LinkedIn ID", "Job URL"]], use_container_width=True, hide_index=True)
 elif not pending_tracker.empty:
     st.dataframe(pending_tracker[["Company", "Role", "Job URL", "Applied Date"]], use_container_width=True, hide_index=True)
-    st.caption("From Tracker. Run Poll or migrate_sheet.py to move to Sent sheet.")
+    st.caption("Tracker has stale Pending status. Click 'Sync Tracker from Sent' above to update.")
 else:
     st.info("No rows pending.")
 
@@ -200,4 +209,9 @@ if df_tracker.empty:
 else:
     st.dataframe(df_tracker, use_container_width=True, hide_index=True)
 
-st.caption("Data refreshes every 60 seconds. Click the refresh button in the top-right to force reload.")
+if st.button("🔄 Refresh data"):
+    load_tracker.clear()
+    load_sent.clear()
+    st.rerun()
+
+st.caption("Data refreshes every 60 seconds, or click Refresh data above.")
