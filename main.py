@@ -216,8 +216,8 @@ async def send_messages():
     Updates Status to Message Sent on success.
     """
     logger.info("=== send_messages started ===")
-    pending = sheets.get_pending_rows()
-    logger.info("Pending rows to message: %d", len(pending))
+    pending = sheets.get_pending_rows(include_no_resume=True)  # Retry No Resume when resume added to Drive
+    logger.info("Rows to message (Pending + No Resume retry): %d", len(pending))
 
     if not pending:
         logger.info("Nothing to send.")

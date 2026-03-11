@@ -235,18 +235,19 @@ def add_pending_to_sent_sheet(
     ws.append_row([li_name or "", company or "", li_url or "", job_url or "", role or "", STATUS_PENDING])
 
 
-def get_pending_rows() -> list[dict]:
-    """Returns rows from Sent sheet with Status == 'Pending Message'."""
+def get_pending_rows(include_no_resume: bool = True) -> list[dict]:
+    """Returns rows from Sent sheet with Status == 'Pending Message' (and 'No Resume' if include_no_resume)."""
     try:
         ws = _sent_worksheet()
     except gspread.exceptions.WorksheetNotFound:
         return []
     records = ws.get_all_values()
     results = []
+    statuses = (STATUS_PENDING, STATUS_NO_RESUME) if include_no_resume else (STATUS_PENDING,)
     for i, row in enumerate(records[1:], start=2):
         if len(row) <= SENT_COL_STATUS:
             continue
-        if row[SENT_COL_STATUS].strip() != STATUS_PENDING:
+        if row[SENT_COL_STATUS].strip() not in statuses:
             continue
         results.append({
             "row_index":   i,
