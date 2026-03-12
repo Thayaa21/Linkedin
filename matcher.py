@@ -66,6 +66,19 @@ def find_matching_row(
             logger.info("Matched '%s' → '%s' (exact)", connection_company, row["company"])
             return row
 
+    # Noise handling: extracted text like "Gartner and Ordnance Officer in the US Army Reserve"
+    # — check if sheet company appears as a whole word in the noisy string
+    for row in sheet_rows:
+        sheet_company = row["company"].strip()
+        if not sheet_company:
+            continue
+        pattern = r"\b" + re.escape(sheet_company) + r"\b"
+        if re.search(pattern, connection_company, re.IGNORECASE):
+            logger.info(
+                "Matched '%s' → '%s' (contains)", connection_company, sheet_company
+            )
+            return row
+
     # Build lookup: normalised company name → row
     choices = {row["company"]: row for row in sheet_rows}
 

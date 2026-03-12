@@ -19,7 +19,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-SEND_DELAY_SECONDS = 5  # Delay between sends to avoid rate limiting
+SEND_DELAY_SECONDS = 8  # Delay between sends (prevents wrong recipient when back-to-back)
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -90,7 +90,10 @@ async def poll_connections():
                 logger.error("LinkedIn session expired. Re-run save_cookies.py.")
                 return
 
-            current = await li.get_connections(page)
+            old_snapshot = sheets.load_snapshot_from_sheet()
+            logger.info("Snapshot loaded: %d previously seen connections", len(old_snapshot))
+
+            current = await li.get_connections(page, old_snapshot)
 
             # ── Pass 1: headline extraction ────────────────────────────────────
             headline_filled = 0
@@ -103,9 +106,6 @@ async def poll_connections():
                     conn["current_company"] = extracted
                     headline_filled += 1
             logger.info("Headline extraction filled company for %d connections", headline_filled)
-
-            old_snapshot = sheets.load_snapshot_from_sheet()
-            logger.info("Snapshot loaded: %d previously seen connections", len(old_snapshot))
 
             for url, snap_conn in old_snapshot.items():
                 if url in current and not current[url].get("current_company"):
@@ -231,11 +231,13 @@ async def send_messages():
                 logger.error("No cookies. Run save_cookies.py first.")
                 return
 
-            page = await context.new_page()
-
-            if not await li.is_logged_in(page):
+            # Verify session with a temp page, then close it
+            check_page = await context.new_page()
+            if not await li.is_logged_in(check_page):
+                await check_page.close()
                 logger.error("LinkedIn session expired. Re-run save_cookies.py.")
                 return
+            await check_page.close()
 
             already_sent = sheets.get_sent_li_urls()
             for i, row in enumerate(pending):
@@ -267,6 +269,7 @@ async def send_messages():
 
                 success = False
                 for attempt in range(2):
+                    page = await context.new_page()
                     try:
                         success = await li.send_message(page, profile_url, message)
                         if success:
@@ -278,6 +281,8 @@ async def send_messages():
                         logger.error("Error sending to %s (attempt %d): %s", li_name, attempt + 1, e)
                         if attempt == 0:
                             await asyncio.sleep(3)
+                    finally:
+                        await page.close()
                 if success:
                     sheets.mark_sent_in_sent_sheet(row["row_index"])
                     sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)

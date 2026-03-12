@@ -27,6 +27,16 @@ LINKEDIN_BASE = "https://www.linkedin.com"
 CONNECTIONS_URL = f"{LINKEDIN_BASE}/mynetwork/invite-connect/connections/"
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize LinkedIn profile URL for comparison."""
+    u = (url or "").strip().lower().rstrip("/")
+    if "linkedin.com/in/" in u:
+        parts = u.split("linkedin.com/in/", 1)
+        profile = parts[-1].split("?")[0].rstrip("/")
+        return f"linkedin.com/in/{profile}"
+    return u
+
+
 # ─── Human-like delays ────────────────────────────────────────────────────────
 
 async def _pause(lo=1.0, hi=3.0):
@@ -62,20 +72,14 @@ async def is_logged_in(page: Page) -> bool:
 
 # ─── Connections scraping ─────────────────────────────────────────────────────
 
-async def get_connections(page: Page) -> dict[str, dict]:
+async def get_connections(page: Page, old_snapshot: dict | None = None) -> dict[str, dict]:
     """
-    Scrapes the LinkedIn Connections page, scrolling until all connections load.
+    Scrapes the LinkedIn Connections page. Fetches 50 per page (RECENTLY_ADDED order);
+    stops when we hit someone already in old_snapshot, then merges new into existing.
 
-    Returns a dict keyed by profile URL:
-      {
-        "https://linkedin.com/in/jane-doe": {
-          "name":     "Jane Doe",
-          "headline": "Software Engineer at Stripe",
-          "url":      "https://linkedin.com/in/jane-doe",
-        },
-        ...
-      }
+    Returns a dict keyed by profile URL (old_snapshot + newly fetched).
     """
+    old_snapshot = old_snapshot or {}
     # Navigate to LinkedIn home to establish session (not connections page directly)
     logger.info("Navigating to LinkedIn to establish session...")
     page.on("console", lambda msg: logger.info("BROWSER: %s", msg.text) if msg.type == "log" else None)
@@ -196,90 +200,111 @@ async def get_connections(page: Page) -> dict[str, dict]:
     )
 
     # ── Step 3: If scrolling didn't yield profiles, fall back to API ──────────
+    known_urls = [_normalize_url(u) for u in old_snapshot.keys()]
     if len(intercepted_profiles) < 5:
         logger.info("Still few profiles after scroll — calling Voyager API directly...")
         api_result = await page.evaluate("""
-            async (csrfToken) => {
-                // Get connection URNs first
-                const connResp = await fetch(
-                    '/voyager/api/relationships/dash/connections?count=50&q=search&sortType=RECENTLY_ADDED',
-                    {
-                        headers: {
-                            'Accept': 'application/vnd.linkedin.normalized+json+2.1',
-                            'csrf-token': csrfToken,
-                            'x-restli-protocol-version': '2.0.0',
-                        },
-                        credentials: 'include',
-                    }
-                );
-                if (!connResp.ok) return { ok: false, error: 'connections ' + connResp.status };
-                const connData = JSON.parse(await connResp.text());
+            async ({csrfToken, knownUrls}) => {
+                const PAGE_SIZE = 50;
+                const knownSet = new Set((knownUrls || []).map(u => u.toLowerCase()));
+                const hasExisting = knownSet.size > 0;
+                let allProfiles = {};
+                let start = 0;
+                let hitExisting = false;
 
-                const memberUrns = (connData.included || [])
-                    .filter(e => e.$type && e.$type.toLowerCase().includes('connection') && e.connectedMember)
-                    .map(e => e.connectedMember);
-
-                console.log('Connection URNs: ' + memberUrns.length);
-                if (!memberUrns.length) return { ok: false, error: 'no URNs' };
-
-                // Try several batch-profile endpoint formats — LinkedIn changes these
-                const profileIds  = memberUrns.map(u => u.split(':').pop());
-                const encodedUrns = memberUrns.map(encodeURIComponent).join(',');
-                const encodedIds  = profileIds.map(encodeURIComponent).join(',');
-
-                const endpoints = [
-                    // New dash format with full URNs
-                    '/voyager/api/identity/dash/profiles?ids=List(' + encodedUrns + ')',
-                    // Old format with bare IDs
-                    '/voyager/api/identity/profiles?ids=List(' + encodedIds + ')',
-                    // miniProfile (old)
-                    '/voyager/api/identity/miniProfiles?ids=List(' + encodedIds + ')',
-                ];
-
-                for (const ep of endpoints) {
-                    try {
-                        const r = await fetch(ep, {
+                while (true) {
+                    const connResp = await fetch(
+                        '/voyager/api/relationships/dash/connections?count=' + PAGE_SIZE + '&start=' + start + '&q=search&sortType=RECENTLY_ADDED',
+                        {
                             headers: {
                                 'Accept': 'application/vnd.linkedin.normalized+json+2.1',
                                 'csrf-token': csrfToken,
                                 'x-restli-protocol-version': '2.0.0',
                             },
                             credentials: 'include',
-                        });
-                        const body = await r.text();
-                        console.log('Batch profiles ' + ep.split('?')[0] + ' → ' + r.status + ' ' + body.slice(0, 200));
-                        if (r.ok) return { ok: true, profiles: JSON.parse(body), urns: memberUrns };
-                    } catch(e) {
-                        console.log('Error ' + ep + ': ' + e.message);
+                        }
+                    );
+                    if (!connResp.ok) return { ok: false, error: 'connections ' + connResp.status };
+                    const connData = JSON.parse(await connResp.text());
+
+                    const memberUrns = (connData.included || [])
+                        .filter(e => e.$type && e.$type.toLowerCase().includes('connection') && e.connectedMember)
+                        .map(e => e.connectedMember);
+
+                    if (!memberUrns.length) break;
+
+                    const encodedUrns = memberUrns.map(encodeURIComponent).join(',');
+                    const encodedIds = memberUrns.map(u => u.split(':').pop()).map(encodeURIComponent).join(',');
+                    const endpoints = [
+                        '/voyager/api/identity/dash/profiles?ids=List(' + encodedUrns + ')',
+                        '/voyager/api/identity/profiles?ids=List(' + encodedIds + ')',
+                        '/voyager/api/identity/miniProfiles?ids=List(' + encodedIds + ')',
+                    ];
+
+                    let got = false;
+                    for (const ep of endpoints) {
+                        try {
+                            const r = await fetch(ep, {
+                                headers: {
+                                    'Accept': 'application/vnd.linkedin.normalized+json+2.1',
+                                    'csrf-token': csrfToken,
+                                    'x-restli-protocol-version': '2.0.0',
+                                },
+                                credentials: 'include',
+                            });
+                            const body = await r.text();
+                            console.log('Batch profiles ' + ep.split('?')[0] + ' → ' + r.status + ' ' + body.slice(0, 200));
+                            if (r.ok) {
+                                const profiles = JSON.parse(body);
+                                for (const item of (profiles.included || [])) {
+                                    if (item && item.publicIdentifier) {
+                                        allProfiles[item.publicIdentifier] = item;
+                                        const urlNorm = 'linkedin.com/in/' + item.publicIdentifier.toLowerCase();
+                                        if (knownSet.has(urlNorm)) hitExisting = true;
+                                    }
+                                }
+                                for (const item of Object.values(profiles.results || {})) {
+                                    if (item && item.publicIdentifier) {
+                                        allProfiles[item.publicIdentifier] = item;
+                                        const urlNorm = 'linkedin.com/in/' + item.publicIdentifier.toLowerCase();
+                                        if (knownSet.has(urlNorm)) hitExisting = true;
+                                    }
+                                }
+                                got = true;
+                                break;
+                            }
+                        } catch(e) { console.log('Error ' + ep + ': ' + e.message); }
                     }
+                    if (!got) break;
+
+                    console.log('Connection URNs this page: ' + memberUrns.length + ', hitExisting: ' + hitExisting);
+                    if (hitExisting || memberUrns.length < PAGE_SIZE) break;
+                    if (!hasExisting) break;
+                    start += PAGE_SIZE;
+                    await new Promise(r => setTimeout(r, 800));
                 }
 
-                // All batch endpoints failed — return URNs only so we can build profile URLs
-                return { ok: true, urnsOnly: true, urns: memberUrns, profiles: {} };
+                return { ok: true, profiles: { included: Object.values(allProfiles) } };
             }
-        """, csrf_token)
+        """, {"csrfToken": csrf_token, "knownUrls": known_urls})
 
         if api_result and api_result.get("ok"):
             profiles_raw = api_result.get("profiles") or {}
-            # normalized JSON puts profiles in included[]
             for item in (profiles_raw.get("included") or []):
                 if isinstance(item, dict):
                     pid = item.get("publicIdentifier", "")
-                    if pid and pid not in intercepted_profiles:
+                    if pid:
                         intercepted_profiles[pid] = item
-            # plain JSON may put them in results{}
             for item in (profiles_raw.get("results") or {}).values():
                 if isinstance(item, dict):
                     pid = item.get("publicIdentifier", "")
-                    if pid and pid not in intercepted_profiles:
+                    if pid:
                         intercepted_profiles[pid] = item
-            if not intercepted_connections_urns:
-                intercepted_connections_urns.extend(api_result.get("urns") or [])
 
         logger.info("After API fallback: %d profiles collected", len(intercepted_profiles))
 
-    # ── Step 4: Build connections dict from collected profile data ────────────
-    connections: dict[str, dict] = {}
+    # ── Step 4: Build connections dict (merge old_snapshot + newly fetched) ────
+    connections: dict[str, dict] = dict(old_snapshot)
 
     for profile in intercepted_profiles.values():
         try:
@@ -546,10 +571,7 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
     try:
         # Longer timeout for typing long messages (default 30s can be too short)
         page.set_default_timeout(60000)
-        # Reset: go to feed first to close any open message panel from previous send
-        await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
-        await _pause(1, 2)
-        # Now open the target profile fresh
+        # Fresh page per send — navigate directly to profile (no stale message panel)
         await page.goto(profile_url, wait_until="domcontentloaded")
         await _pause(2, 4)
 
