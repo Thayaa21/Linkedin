@@ -265,17 +265,26 @@ async def send_messages():
                     resume_link=resume_link,
                 )
 
-                try:
-                    success = await li.send_message(page, profile_url, message)
-                    if success:
-                        sheets.mark_sent_in_sent_sheet(row["row_index"])
-                        sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
-                        already_sent.add(sheets.normalize_li_url(profile_url))
-                        logger.info("Sent %d/%d: %s", i + 1, len(pending), li_name)
-                    else:
-                        logger.warning("Failed to send to %s, will retry next run.", li_name)
-                except Exception as e:
-                    logger.error("Error sending to %s: %s — continuing to next", li_name, e)
+                success = False
+                for attempt in range(2):
+                    try:
+                        success = await li.send_message(page, profile_url, message)
+                        if success:
+                            break
+                        if attempt == 0:
+                            logger.warning("Send to %s failed, retrying...", li_name)
+                            await asyncio.sleep(3)
+                    except Exception as e:
+                        logger.error("Error sending to %s (attempt %d): %s", li_name, attempt + 1, e)
+                        if attempt == 0:
+                            await asyncio.sleep(3)
+                if success:
+                    sheets.mark_sent_in_sent_sheet(row["row_index"])
+                    sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
+                    already_sent.add(sheets.normalize_li_url(profile_url))
+                    logger.info("Sent %d/%d: %s", i + 1, len(pending), li_name)
+                else:
+                    logger.warning("Failed to send to %s after 2 attempts, will retry next run.", li_name)
 
                 # Delay between sends to avoid rate limiting
                 if i < len(pending) - 1:

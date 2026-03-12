@@ -32,8 +32,7 @@ jobs:
           CONNECTIONS_SNAPSHOT: connections_snapshot.json
         run: python -c "import asyncio; from main import poll_connections; asyncio.run(poll_connections())"
 
-      - name: Run send (9 AM MST daily)
-        if: github.event_name == 'schedule' && github.event.schedule == '0 16 * * *'
+      - name: Run send
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SHEET_TAB: ${{ secrets.SHEET_TAB }}

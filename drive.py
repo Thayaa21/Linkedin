@@ -31,13 +31,20 @@ def _normalize(name: str) -> str:
     return " ".join(name.lower().split())
 
 
+def _normalize_for_match(s: str) -> tuple[str, str]:
+    """Returns (spaced form, no-space form) for flexible matching."""
+    spaced = " ".join(s.lower().split())
+    nospace = spaced.replace(" ", "")
+    return spaced, nospace
+
+
 def get_resume_link(company: str) -> str | None:
     """
-    Returns the webViewLink for {company}_Resume.pdf, or None if not found.
-    Matching is case-insensitive and whitespace-tolerant.
+    Returns the webViewLink for Thayaa_{Company}.pdf, or None if not found.
+    Matching is flexible: case-insensitive, ignores extra spaces, and matches
+    "Newt Global" to "Thayaa_Newt Global.pdf" or "Thayaa_NewtGlobal.pdf".
     """
     service = _drive_service()
-    # List all PDFs in the folder
     query = (
         f"'{DRIVE_FOLDER_ID}' in parents "
         f"and mimeType='application/pdf' "
@@ -50,11 +57,16 @@ def get_resume_link(company: str) -> str | None:
     ).execute()
 
     files = results.get("files", [])
-    target = _normalize(f"thayaa_{company}")
+    company_spaced, company_nospace = _normalize_for_match(company)
 
     for f in files:
-        stem = _normalize(f["name"].replace(".pdf", "").replace(".PDF", ""))
-        if stem == target:
+        name = f["name"].replace(".pdf", "").replace(".PDF", "")
+        if not name.lower().startswith("thayaa_"):
+            continue
+        file_company = name[7:].strip()  # after "thayaa_"
+        file_spaced, file_nospace = _normalize_for_match(file_company)
+        if (company_spaced == file_spaced or company_nospace == file_nospace or
+            company_spaced == file_nospace or company_nospace == file_spaced):
             link = f.get("webViewLink")
             logger.info("Found resume for %s: %s", company, link)
             return link
