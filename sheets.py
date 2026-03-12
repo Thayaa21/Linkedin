@@ -174,8 +174,13 @@ def get_all_jobs() -> list[dict]:
 
 
 def normalize_li_url(url: str) -> str:
-    """Normalize LinkedIn URL for comparison (handles trailing slash, case)."""
+    """Normalize LinkedIn URL for comparison (handles www, trailing slash, case, query params)."""
     u = (url or "").strip().lower().rstrip("/")
+    # Extract profile ID for canonical matching (www vs non-www, different domains)
+    if "linkedin.com/in/" in u:
+        parts = u.split("linkedin.com/in/", 1)
+        profile = parts[-1].split("?")[0].rstrip("/")
+        u = f"linkedin.com/in/{profile}"
     return u
 
 
@@ -219,8 +224,8 @@ def add_pending_to_sent_sheet(
     if not li_url or not li_url.strip():
         return
     li_norm = normalize_li_url(li_url)
-    # Never add if we've already sent to this person
-    if li_norm in get_sent_li_urls():
+    # Never add if we've already contacted this person (any status — prevents duplicate messages)
+    if li_norm in get_tracked_li_urls():
         return
     ensure_sent_sheet_exists()
     ws = _sent_worksheet()
