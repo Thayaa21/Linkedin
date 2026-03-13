@@ -223,6 +223,7 @@ async def send_messages():
         logger.info("Nothing to send.")
         return
 
+    # One-time session check
     async with async_playwright() as p:
         browser, context = await li.make_browser_context(p)
         try:
@@ -230,73 +231,75 @@ async def send_messages():
             if not ok:
                 logger.error("No cookies. Run save_cookies.py first.")
                 return
-
-            # Verify session with a temp page, then close it
             check_page = await context.new_page()
             if not await li.is_logged_in(check_page):
                 await check_page.close()
                 logger.error("LinkedIn session expired. Re-run save_cookies.py.")
                 return
             await check_page.close()
-
-            already_sent = sheets.get_sent_li_urls()
-            for i, row in enumerate(pending):
-                profile_url = row["li_url"]
-                company     = row["company"]
-                role        = row["role"]
-                li_name     = row["li_name"]
-                first_name  = li_name.split()[0] if li_name else "there"
-
-                # Never send to someone we've already messaged (duplicate row guard)
-                if sheets.normalize_li_url(profile_url) in already_sent:
-                    logger.info("Skipping %s — already sent (duplicate row), marking as Message Sent", li_name)
-                    sheets.mark_sent_in_sent_sheet(row["row_index"])
-                    sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
-                    continue
-
-                resume_link = drive.get_resume_link(company)
-                if not resume_link:
-                    logger.warning("No resume for %s — skipping DM, marking No Resume", company)
-                    sheets.mark_no_resume_in_sent_sheet(row["row_index"])
-                    continue
-
-                message = MESSAGE_TEMPLATE.format(
-                    first_name=first_name,
-                    company=company,
-                    role=role,
-                    resume_link=resume_link,
-                )
-
-                success = False
-                for attempt in range(2):
-                    page = await context.new_page()
-                    try:
-                        success = await li.send_message(page, profile_url, message)
-                        if success:
-                            break
-                        if attempt == 0:
-                            logger.warning("Send to %s failed, retrying...", li_name)
-                            await asyncio.sleep(3)
-                    except Exception as e:
-                        logger.error("Error sending to %s (attempt %d): %s", li_name, attempt + 1, e)
-                        if attempt == 0:
-                            await asyncio.sleep(3)
-                    finally:
-                        await page.close()
-                if success:
-                    sheets.mark_sent_in_sent_sheet(row["row_index"])
-                    sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
-                    already_sent.add(sheets.normalize_li_url(profile_url))
-                    logger.info("Sent %d/%d: %s", i + 1, len(pending), li_name)
-                else:
-                    logger.warning("Failed to send to %s after 2 attempts, will retry next run.", li_name)
-
-                # Delay between sends to avoid rate limiting
-                if i < len(pending) - 1:
-                    await asyncio.sleep(SEND_DELAY_SECONDS)
-
         finally:
             await browser.close()
+
+    already_sent = sheets.get_sent_li_urls()
+    for i, row in enumerate(pending):
+        profile_url = row["li_url"]
+        company     = row["company"]
+        role        = row["role"]
+        li_name     = row["li_name"]
+        first_name  = li_name.split()[0] if li_name else "there"
+
+        if sheets.normalize_li_url(profile_url) in already_sent:
+            logger.info("Skipping %s — already sent (duplicate row), marking as Message Sent", li_name)
+            sheets.mark_sent_in_sent_sheet(row["row_index"])
+            sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
+            continue
+
+        resume_link = drive.get_resume_link(company)
+        if not resume_link:
+            logger.warning("No resume for %s — skipping DM, marking No Resume", company)
+            sheets.mark_no_resume_in_sent_sheet(row["row_index"])
+            continue
+
+        message = MESSAGE_TEMPLATE.format(
+            first_name=first_name,
+            company=company,
+            role=role,
+            resume_link=resume_link,
+        )
+
+        success = False
+        for attempt in range(2):
+            async with async_playwright() as p:
+                browser, context = await li.make_browser_context(p)
+                try:
+                    ok = await li.load_cookies(context)
+                    if not ok:
+                        break
+                    page = await context.new_page()
+                    success = await li.send_message(page, profile_url, message)
+                    await page.close()
+                    if success:
+                        break
+                except Exception as e:
+                    logger.error("Error sending to %s (attempt %d): %s", li_name, attempt + 1, e)
+                finally:
+                    await browser.close()
+            if success:
+                break
+            if attempt == 0:
+                logger.warning("Send to %s failed, retrying...", li_name)
+                await asyncio.sleep(3)
+
+        if success:
+            sheets.mark_sent_in_sent_sheet(row["row_index"])
+            sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
+            already_sent.add(sheets.normalize_li_url(profile_url))
+            logger.info("Sent %d/%d: %s", i + 1, len(pending), li_name)
+        else:
+            logger.warning("Failed to send to %s after 2 attempts, will retry next run.", li_name)
+
+        if i < len(pending) - 1:
+            await asyncio.sleep(SEND_DELAY_SECONDS)
 
     logger.info("=== send_messages complete ===")
 
