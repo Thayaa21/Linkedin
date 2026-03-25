@@ -1,37 +1,56 @@
 """
 sheets.py — Google Sheets read/write via gspread (service account auth).
 
-Tracker layout (simplified):
-  A: Applied Date  B: Company  C: Role  D: Job URL  E: Status
+Tracker layout:
+  A: Applied Date  B: Company  C: Role  D: Job URL  E: Status  F: Outreach window
+     ("Still working" / "No longer consider" vs MESSAGE_APPLY_WITHIN_DAYS)
 
 Sent Messages layout (people we've messaged):
   A: Name  B: Company  C: LinkedIn ID  D: Job URL  E: Role  F: Status
 """
 
 import re
+from datetime import date, datetime, timedelta
+
 import gspread
 from google.oauth2.service_account import Credentials
-from config import SHEET_ID, SHEET_TAB, SENT_TAB, GOOGLE_CREDS_FILE
+from config import SHEET_ID, SHEET_TAB, SENT_TAB, GOOGLE_CREDS_FILE, MESSAGE_APPLY_WITHIN_DAYS
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
-# Tracker column indices (0-based) — 5 columns only
+# Tracker column indices (0-based)
 COL_APPLIED_DATE = 0
 COL_COMPANY     = 1
 COL_ROLE        = 2
 COL_URL         = 3
 COL_STATUS      = 4
+COL_OUTREACH    = 5
 
 STATUS_APPLIED          = "Applied"
 STATUS_PENDING          = "Pending Message"
 STATUS_SENT             = "Message Sent"
 STATUS_NO_RESUME        = "No Resume"
 STATUS_ALREADY_MESSAGED = "Already Messaged"
+STATUS_OUTSIDE_MESSAGE_WINDOW = "Outside Message Window"
 
-TRACKER_HEADERS = ["Applied Date", "Company", "Role", "Job URL", "Status"]
+# Tracker column F: derived from Applied Date + MESSAGE_APPLY_WITHIN_DAYS (updated every poll)
+OUTREACH_STILL_WORKING = "Still working"
+OUTREACH_NO_LONGER_CONSIDER = "No longer consider"
+
+# Applied Date can appear 1 calendar day ahead of local today (sheet TZ, copy/paste, UTC storage).
+OUTREACH_MAX_FUTURE_SLACK_DAYS = 1
+
+TRACKER_HEADERS = [
+    "Applied Date",
+    "Company",
+    "Role",
+    "Job URL",
+    "Status",
+    "Outreach window",
+]
 
 # Sent sheet columns
 SENT_COL_NAME    = 0
@@ -53,12 +72,119 @@ def _worksheet():
     return _client().open_by_key(SHEET_ID).worksheet(SHEET_TAB)
 
 
+# Sheets / Excel serial days: day N is this many days after 1899-12-30 (45292 → 2024-01-01).
+_SHEETS_SERIAL_ORIGIN = date(1899, 12, 30)
+
+
+def _date_from_sheets_serial(n: float) -> date | None:
+    """Convert numeric Google Sheets date cell (possibly .0 float) to calendar date."""
+    try:
+        whole = int(float(n))
+    except (TypeError, ValueError):
+        return None
+    if whole < 0 or whole > 600_000:
+        return None
+    try:
+        d = _SHEETS_SERIAL_ORIGIN + timedelta(days=whole)
+    except OverflowError:
+        return None
+    if not (1970 <= d.year <= 2105):
+        return None
+    return d
+
+
+def _parse_applied_date_to_date(raw) -> date | None:
+    """
+    Parse Tracker Applied Date as returned by gspread (formatted or serial).
+    Handles ISO, M/D/Y, D/M/Y, a few month-name forms, and Sheets serial numbers.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return _date_from_sheets_serial(float(raw))
+    s = str(raw).strip()
+    if not s:
+        return None
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return _date_from_sheets_serial(float(s))
+    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        part = s[:10]
+        try:
+            return datetime.strptime(part, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00").replace("z", "+00:00")[:19]).date()
+        except ValueError:
+            pass
+    token = s.split()[0]
+    for fmt in (
+        "%m/%d/%Y",
+        "%d/%m/%Y",
+        "%Y/%m/%d",
+        "%m/%d/%y",
+        "%d/%m/%y",
+        "%m-%d-%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d",
+        "%d-%b-%Y",
+        "%d-%B-%Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+    ):
+        try:
+            return datetime.strptime(token, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def _to_applied_date(ts: str) -> str:
-    """Extract YYYY-MM-DD from timestamp like 2026-03-10T07:..."""
-    if not ts:
-        return ""
-    m = re.match(r"(\d{4}-\d{2}-\d{2})", ts.strip())
-    return m.group(1) if m else ts[:10] if len(ts) >= 10 else ts
+    """Normalize Applied Date cell to YYYY-MM-DD for storage/compare, or \"\" if unknown."""
+    d = _parse_applied_date_to_date(ts)
+    return d.isoformat() if d else ""
+
+
+def _applied_date_in_outreach_window(applied_d: date, limit: int) -> bool:
+    """True if applied_d is not older than limit days, allowing small future skew."""
+    age = (date.today() - applied_d).days
+    return -OUTREACH_MAX_FUTURE_SLACK_DAYS <= age <= limit
+
+
+def outreach_window_label_for_applied_date(
+    applied_raw: str, max_days: int | None = None,
+) -> str:
+    """Per Tracker row: still inside MESSAGE_APPLY_WITHIN_DAYS or not."""
+    limit = MESSAGE_APPLY_WITHIN_DAYS if max_days is None else max_days
+    if limit < 0:
+        limit = 0
+    applied_d = _parse_applied_date_to_date(applied_raw)
+    if not applied_d:
+        return OUTREACH_NO_LONGER_CONSIDER
+    if _applied_date_in_outreach_window(applied_d, limit):
+        return OUTREACH_STILL_WORKING
+    return OUTREACH_NO_LONGER_CONSIDER
+
+
+def refresh_tracker_outreach_column():
+    """
+    Write Tracker column F from each row's Applied Date (MESSAGE_APPLY_WITHIN_DAYS).
+    Call on every poll so the sheet stays correct as days pass.
+    """
+    ws = _worksheet()
+    rows = ws.get_all_values()
+    if not rows:
+        return
+    h0 = list(rows[0])
+    hdr = (h0 + [""] * 5)[:5] + [TRACKER_HEADERS[COL_OUTREACH]]
+    out: list[list[str]] = [hdr]
+    for row in rows[1:]:
+        r = (list(row) + [""] * 5)[:5]
+        label = outreach_window_label_for_applied_date(
+            r[COL_APPLIED_DATE] if r else "",
+        )
+        out.append(r + [label])
+    ws.update(f"A1:F{len(out)}", out)
 
 
 def ensure_sent_sheet_exists():
@@ -82,7 +208,7 @@ def _sent_worksheet():
 
 def refine_tracker_sheet():
     """
-    Refines the tracker: timestamp→date, removes Source/Name/LI/Resume, 5 cols only.
+    Refines the tracker: timestamp→date, removes Source/Name/LI/Resume, 6 cols (incl. Outreach window).
     Migrates any Pending/Sent rows with person data to Sent sheet first.
     """
     ws = _worksheet()
@@ -123,10 +249,11 @@ def refine_tracker_sheet():
             ])
             sent_li_urls.add(li_url)
 
-        new_rows.append([applied_date, company, role, job_url, status])
+        outreach = outreach_window_label_for_applied_date(applied_date)
+        new_rows.append([applied_date, company, role, job_url, status, outreach])
 
     ws.clear()
-    ws.update(f"A1:E{len(new_rows)}", new_rows)
+    ws.update(f"A1:F{len(new_rows)}", new_rows)
 
 
 # ─── Read ─────────────────────────────────────────────────────────────────────
@@ -184,6 +311,70 @@ def normalize_li_url(url: str) -> str:
     return u
 
 
+def normalize_job_url(url: str) -> str:
+    u = (url or "").strip().lower().rstrip("/")
+    if "?" in u:
+        u = u.split("?", 1)[0]
+    return u
+
+
+def get_applied_date_for_application(company: str, job_url: str) -> str | None:
+    """
+    Tracker Applied Date (YYYY-MM-DD) for this company/position.
+    Prefers a row whose Job URL matches job_url; otherwise the latest date among
+    tracker rows for that company (when Sent row has no job URL).
+    """
+    if not company or not company.strip():
+        return None
+    ws = _worksheet()
+    records = ws.get_all_values()
+    want_job = normalize_job_url(job_url)
+    company_l = company.strip().lower()
+    same_company: list[tuple[str, str]] = []  # (norm_job_url, applied_date)
+    for row in records[1:]:
+        if len(row) <= COL_COMPANY:
+            continue
+        row_co = row[COL_COMPANY].strip() if len(row) > COL_COMPANY else ""
+        if row_co.lower() != company_l:
+            continue
+        ts = _to_applied_date(row[COL_APPLIED_DATE].strip() if len(row) > COL_APPLIED_DATE else "")
+        row_url = row[COL_URL].strip() if len(row) > COL_URL else ""
+        same_company.append((normalize_job_url(row_url), ts))
+
+    if not same_company:
+        return None
+
+    if want_job:
+        for norm_u, ts in same_company:
+            if norm_u == want_job and ts:
+                return ts
+        return None
+
+    dated = [ts for _, ts in same_company if ts]
+    if not dated:
+        return None
+    return max(dated)
+
+
+def application_is_within_messaging_window(
+    company: str, job_url: str, max_days: int | None = None,
+) -> bool:
+    """True if Tracker applied date is within the outreach window (incl. small future-date slack)."""
+    limit = MESSAGE_APPLY_WITHIN_DAYS if max_days is None else max_days
+    if limit < 0:
+        limit = 0
+    applied = get_applied_date_for_application(company, job_url)
+    if not applied:
+        return False
+    try:
+        applied_d = datetime.strptime(applied[:10], "%Y-%m-%d").date()
+    except ValueError:
+        applied_d = _parse_applied_date_to_date(applied)
+        if not applied_d:
+            return False
+    return _applied_date_in_outreach_window(applied_d, limit)
+
+
 def get_tracked_li_urls() -> set[str]:
     """Returns all LinkedIn URLs in Sent sheet (Pending + Sent)."""
     try:
@@ -222,6 +413,8 @@ def add_pending_to_sent_sheet(
 ):
     """Add a row to Sent sheet with Status=Pending (when we match a connection)."""
     if not li_url or not li_url.strip():
+        return
+    if not application_is_within_messaging_window(company, job_url):
         return
     li_norm = normalize_li_url(li_url)
     # Never add if we've already contacted this person (any status — prevents duplicate messages)
@@ -292,6 +485,12 @@ def mark_no_resume_in_sent_sheet(row_index: int):
     """Update Sent sheet row to Status=No Resume (skip sending)."""
     ws = _sent_worksheet()
     ws.update_cell(row_index, SENT_COL_STATUS + 1, STATUS_NO_RESUME)
+
+
+def mark_outside_message_window_in_sent_sheet(row_index: int):
+    """Sent sheet row is not messaged because application is outside the configured day window."""
+    ws = _sent_worksheet()
+    ws.update_cell(row_index, SENT_COL_STATUS + 1, STATUS_OUTSIDE_MESSAGE_WINDOW)
 
 
 def mark_person_as_sent(li_url: str | None = None, name: str | None = None) -> bool:

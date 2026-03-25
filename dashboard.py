@@ -5,7 +5,7 @@ Run locally:
     streamlit run dashboard.py
 
 Shows:
-  - Tracker: Applied Date, Company, Role, Job URL, Status (5 cols)
+  - Tracker: Applied Date, Company, Role, Job URL, Status, Outreach window
   - Sent sheet: Name, Company, LinkedIn ID, Job URL (people we've messaged)
 """
 
@@ -36,6 +36,9 @@ STATUS_COLORS = {
     "Pending Message":  "#F5A623",
     "Message Sent":     "#7ED321",
     "No Resume":        "#D0021B",
+    "Outside Message Window": "#B8B8B8",
+    "Still working":    "#7ED321",
+    "No longer consider": "#9B9B9B",
     "Already Messaged": "#9B9B9B",
 }
 
@@ -46,7 +49,7 @@ GH_REPO  = os.environ.get("GH_REPO", "")
 
 @st.cache_data(ttl=30)
 def load_tracker() -> pd.DataFrame:
-    """Load Tracker sheet (5 columns)."""
+    """Load Tracker sheet (incl. Outreach window)."""
     creds = Credentials.from_service_account_file(GOOGLE_CREDS, scopes=SCOPES)
     gc = gspread.authorize(creds)
     try:
@@ -56,10 +59,17 @@ def load_tracker() -> pd.DataFrame:
     rows = ws.get_all_values()
     if len(rows) < 2:
         return pd.DataFrame()
-    headers = ["Applied Date", "Company", "Role", "Job URL", "Status"]
+    headers = [
+        "Applied Date",
+        "Company",
+        "Role",
+        "Job URL",
+        "Status",
+        "Outreach window",
+    ]
     data = []
     for row in rows[1:]:
-        padded = (row + [""] * 5)[:5]
+        padded = (row + [""] * 6)[:6]
         data.append(padded)
     return pd.DataFrame(data, columns=headers)
 
@@ -203,7 +213,10 @@ else:
     st.info("No messages sent yet.")
 
 # ── Tracker: Applications ──────────────────────────────────────────────────────
-st.subheader("📋 Tracker — Applications (Applied Date, Company, Role, Job URL, Status)")
+_outreach_days = os.environ.get("MESSAGE_APPLY_WITHIN_DAYS", "12")
+st.subheader(
+    f"📋 Tracker — Applications (Outreach window = last {_outreach_days} days from Applied Date)"
+)
 if df_tracker.empty:
     st.info("No tracker data.")
 else:

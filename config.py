@@ -23,6 +23,9 @@ CONNECTIONS_SNAPSHOT  = os.environ.get('CONNECTIONS_SNAPSHOT', 'connections_snap
 POLL_INTERVAL_HOURS = int(os.environ.get('POLL_INTERVAL_HOURS', '6'))
 SEND_HOUR           = int(os.environ.get('SEND_HOUR', '9'))   # 9 AM local time
 
+# Only queue / send DMs for applications whose Tracker "Applied Date" is within this many days (inclusive).
+MESSAGE_APPLY_WITHIN_DAYS = int(os.environ.get('MESSAGE_APPLY_WITHIN_DAYS', '12'))
+
 # ─── Message template ─────────────────────────────────────────────────────────
 # Available placeholders: {first_name} {company} {role} {resume_link}
 MESSAGE_TEMPLATE = os.environ.get('MESSAGE_TEMPLATE', """\

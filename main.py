@@ -35,6 +35,7 @@ from config import (
     POLL_INTERVAL_HOURS,
     SEND_HOUR,
     MESSAGE_TEMPLATE,
+    MESSAGE_APPLY_WITHIN_DAYS,
 )
 
 logging.basicConfig(
@@ -69,12 +70,18 @@ async def poll_connections():
     except Exception as e:
         logger.warning("Could not deduplicate Sent sheet: %s", e)
 
-    # Refine tracker: timestamp→date, 5 cols only (no Name, LI, Resume)
+    # Refine tracker: timestamp→date, 6 cols (incl. Outreach window)
     try:
         sheets.refine_tracker_sheet()
-        logger.info("Tracker sheet refined (5 columns)")
+        logger.info("Tracker sheet refined (6 columns incl. Outreach window)")
     except Exception as e:
         logger.warning("Could not refine tracker: %s", e)
+
+    try:
+        sheets.refresh_tracker_outreach_column()
+        logger.info("Tracker Outreach window column refreshed")
+    except Exception as e:
+        logger.warning("Could not refresh tracker outreach column: %s", e)
 
     async with async_playwright() as p:
         browser, context = await li.make_browser_context(p)
@@ -252,6 +259,18 @@ async def send_messages():
             logger.info("Skipping %s — already sent (duplicate row), marking as Message Sent", li_name)
             sheets.mark_sent_in_sent_sheet(row["row_index"])
             sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
+            continue
+
+        if not sheets.application_is_within_messaging_window(
+            company, row.get("job_url", ""), MESSAGE_APPLY_WITHIN_DAYS
+        ):
+            logger.info(
+                "Skipping %s — application for %s is outside the last %d days (Tracker Applied Date); marking Outside Message Window",
+                li_name,
+                company,
+                MESSAGE_APPLY_WITHIN_DAYS,
+            )
+            sheets.mark_outside_message_window_in_sent_sheet(row["row_index"])
             continue
 
         resume_link = drive.get_resume_link(company)
