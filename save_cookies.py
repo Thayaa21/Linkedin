@@ -20,7 +20,7 @@ from config import COOKIES_FILE
 
 async def main():
     print("Opening LinkedIn in a real browser window.")
-    print("Log in manually, then press ENTER here to save cookies.\n")
+    print("Log in manually. Cookies will be saved automatically once you reach the feed.\n")
 
     async with async_playwright() as p:
         # Launch a VISIBLE (headed) browser so you can log in
@@ -36,16 +36,23 @@ async def main():
         await page.goto("https://www.linkedin.com/login")
 
         print("⏳ Waiting for you to log in...")
-        print("   Complete any 2FA if prompted, then press ENTER here.")
-        input()
+        print("   Complete any 2FA if prompted.")
+        print("   Cookies will save automatically once LinkedIn loads.\n")
 
-        # Confirm we're actually logged in
-        try:
-            if "feed" not in page.url and "mynetwork" not in page.url:
-                await page.goto("https://www.linkedin.com/feed/")
-                await page.wait_for_load_state("networkidle", timeout=60000)
-        except Exception:
-            pass  # Continue even if timeout
+        # Wait until the URL changes away from login/authwall (max 5 minutes)
+        for _ in range(300):
+            await asyncio.sleep(1)
+            url = page.url
+            if ("feed" in url or "mynetwork" in url or "messaging" in url
+                    or "jobs" in url or "notifications" in url):
+                break
+        else:
+            print("❌ Timed out waiting for login. Try again.")
+            await browser.close()
+            return
+
+        # Give page a moment to settle
+        await asyncio.sleep(3)
 
         if "authwall" in page.url or "login" in page.url:
             print("❌ Doesn't look like you're logged in yet. Try again.")
