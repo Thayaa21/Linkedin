@@ -287,27 +287,20 @@ async def send_messages():
         )
 
         success = False
-        for attempt in range(2):
-            async with async_playwright() as p:
-                browser, context = await li.make_browser_context(p)
-                try:
-                    ok = await li.load_cookies(context)
-                    if not ok:
-                        break
+        async with async_playwright() as p:
+            browser, context = await li.make_browser_context(p)
+            try:
+                ok = await li.load_cookies(context)
+                if not ok:
+                    logger.error("No cookies for %s — skipping", li_name)
+                else:
                     page = await context.new_page()
                     success = await li.send_message(page, profile_url, message)
                     await page.close()
-                    if success:
-                        break
-                except Exception as e:
-                    logger.error("Error sending to %s (attempt %d): %s", li_name, attempt + 1, e)
-                finally:
-                    await browser.close()
-            if success:
-                break
-            if attempt == 0:
-                logger.warning("Send to %s failed, retrying...", li_name)
-                await asyncio.sleep(3)
+            except Exception as e:
+                logger.error("Error sending to %s: %s", li_name, e)
+            finally:
+                await browser.close()
 
         if success:
             sheets.mark_sent_in_sent_sheet(row["row_index"])
@@ -315,7 +308,7 @@ async def send_messages():
             already_sent.add(sheets.normalize_li_url(profile_url))
             logger.info("Sent %d/%d: %s", i + 1, len(pending), li_name)
         else:
-            logger.warning("Failed to send to %s after 2 attempts, will retry next run.", li_name)
+            logger.warning("Failed to send to %s — will retry next run.", li_name)
 
         if i < len(pending) - 1:
             await asyncio.sleep(SEND_DELAY_SECONDS)

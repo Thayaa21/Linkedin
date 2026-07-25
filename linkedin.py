@@ -699,7 +699,7 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             )
         await _pause(1, 2)
 
-        # Click Send — try multiple selectors and click methods
+        # Click Send — try multiple selectors to find the button
         send_btn = None
         for sel in [
             "button.msg-form__send-button",
@@ -707,13 +707,11 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             "button[type='submit'].msg-form__send-button",
             "button[type='submit']:has-text('Send')",
             "[aria-label='Send']",
-            "button:has-text('Send'):not(:has-text('Send '))",
             ".msg-form__send-button",
         ]:
             try:
                 send_btn = await page.query_selector(sel)
                 if send_btn:
-                    # Make sure it's visible and enabled
                     is_disabled = await send_btn.evaluate("el => el.disabled || el.getAttribute('aria-disabled') === 'true'")
                     if not is_disabled:
                         break
@@ -725,50 +723,19 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             logger.warning("Send button not found for %s", profile_url)
             return False
 
-        # Try multiple click approaches — LinkedIn's SPA can be picky
+        # Single send attempt — click once, wait, verify
         await send_btn.evaluate("el => el.scrollIntoView({block: 'center'})")
-        await _pause(0.3, 0.5)
-
-        # Method 1: direct JS click
+        await _pause(0.5, 1)
         await send_btn.evaluate("el => el.click()")
-        await _pause(1, 1.5)
+        await _pause(3, 5)
 
-        # Check if composer cleared
-        composer_text = await composer.evaluate("el => el.innerText.trim()")
-        if composer_text and len(composer_text) > 50:
-            # Method 2: keyboard shortcut (Enter submits in LinkedIn)
-            logger.info("Send click didn't work, trying Enter key for %s", profile_url)
-            await composer.evaluate("el => el.focus()")
-            await page.keyboard.press("Enter")
-            await _pause(2, 3)
-
-            composer_text = await composer.evaluate("el => el.innerText.trim()")
-            if composer_text and len(composer_text) > 50:
-                # Method 3: Playwright native click with force
-                logger.info("Enter didn't work, trying force click for %s", profile_url)
-                try:
-                    await send_btn.click(force=True)
-                    await _pause(2, 3)
-                    composer_text = await composer.evaluate("el => el.innerText.trim()")
-                except Exception:
-                    pass
-
-        await send_btn.evaluate("el => el.scrollIntoView({block: 'center'})")
-        await _pause(0.3, 0.5)
-        await send_btn.evaluate("el => el.click()")
-        await _pause(2, 3)
-
-        # ── Verify message was actually sent ─────────────────────────────────
-        # Check that the composer is now empty (message was consumed by LinkedIn)
-        if not composer_text:
-            composer_text = ""
+        # Verify: composer should be empty if message was sent
         try:
             composer_text = await composer.evaluate("el => el.innerText.trim()")
         except Exception:
             composer_text = ""
 
         if composer_text and len(composer_text) > 50:
-            # Composer still has text — message wasn't sent
             logger.warning("Message NOT sent to %s — composer still has text", profile_url)
             return False
 
