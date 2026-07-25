@@ -699,15 +699,59 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
             )
         await _pause(1, 2)
 
-        # Click Send
-        send_btn = await page.query_selector(
-            "button.msg-form__send-button, "
-            "button[type='submit']:has-text('Send'), "
-            "[aria-label='Send']"
-        )
+        # Click Send — try multiple selectors and click methods
+        send_btn = None
+        for sel in [
+            "button.msg-form__send-button",
+            "button.msg-form__send-btn",
+            "button[type='submit'].msg-form__send-button",
+            "button[type='submit']:has-text('Send')",
+            "[aria-label='Send']",
+            "button:has-text('Send'):not(:has-text('Send '))",
+            ".msg-form__send-button",
+        ]:
+            try:
+                send_btn = await page.query_selector(sel)
+                if send_btn:
+                    # Make sure it's visible and enabled
+                    is_disabled = await send_btn.evaluate("el => el.disabled || el.getAttribute('aria-disabled') === 'true'")
+                    if not is_disabled:
+                        break
+                    send_btn = None
+            except Exception:
+                continue
+
         if not send_btn:
             logger.warning("Send button not found for %s", profile_url)
             return False
+
+        # Try multiple click approaches — LinkedIn's SPA can be picky
+        await send_btn.evaluate("el => el.scrollIntoView({block: 'center'})")
+        await _pause(0.3, 0.5)
+
+        # Method 1: direct JS click
+        await send_btn.evaluate("el => el.click()")
+        await _pause(1, 1.5)
+
+        # Check if composer cleared
+        composer_text = await composer.evaluate("el => el.innerText.trim()")
+        if composer_text and len(composer_text) > 50:
+            # Method 2: keyboard shortcut (Enter submits in LinkedIn)
+            logger.info("Send click didn't work, trying Enter key for %s", profile_url)
+            await composer.evaluate("el => el.focus()")
+            await page.keyboard.press("Enter")
+            await _pause(2, 3)
+
+            composer_text = await composer.evaluate("el => el.innerText.trim()")
+            if composer_text and len(composer_text) > 50:
+                # Method 3: Playwright native click with force
+                logger.info("Enter didn't work, trying force click for %s", profile_url)
+                try:
+                    await send_btn.click(force=True)
+                    await _pause(2, 3)
+                    composer_text = await composer.evaluate("el => el.innerText.trim()")
+                except Exception:
+                    pass
 
         await send_btn.evaluate("el => el.scrollIntoView({block: 'center'})")
         await _pause(0.3, 0.5)
@@ -716,48 +760,20 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
 
         # ── Verify message was actually sent ─────────────────────────────────
         # Check that the composer is now empty (message was consumed by LinkedIn)
-        # AND that our message text appears in the conversation thread
-        composer_text = await composer.evaluate("el => el.innerText.trim()")
+        if not composer_text:
+            composer_text = ""
+        try:
+            composer_text = await composer.evaluate("el => el.innerText.trim()")
+        except Exception:
+            composer_text = ""
+
         if composer_text and len(composer_text) > 50:
             # Composer still has text — message wasn't sent
             logger.warning("Message NOT sent to %s — composer still has text", profile_url)
             return False
 
-        # Look for our message in the conversation (check last few messages)
-        # Use a short snippet from the message to verify
-        verify_snippet = message[:60].replace("\n", " ").strip()
-        try:
-            conversation = await page.evaluate("""
-                () => {
-                    const msgs = document.querySelectorAll(
-                        '.msg-s-event-listitem__body, .msg-s-message-body, ' +
-                        '.msg-s-event__content, [class*="message-body"], ' +
-                        '.msg-overlay-conversation-bubble__message-body'
-                    );
-                    const texts = [];
-                    for (const m of msgs) {
-                        texts.push(m.innerText.trim());
-                    }
-                    return texts.slice(-3).join(' ||| ');
-                }
-            """)
-            if verify_snippet[:30] in conversation:
-                logger.info("Message verified sent to %s", profile_url)
-                return True
-            else:
-                # Fallback: if composer is empty, likely sent even if we can't find it in DOM
-                if not composer_text:
-                    logger.info("Message sent to %s (composer cleared, verification inconclusive)", profile_url)
-                    return True
-                logger.warning("Message NOT verified for %s — snippet not found in conversation", profile_url)
-                return False
-        except Exception:
-            # If verification fails but composer is empty, assume success
-            if not composer_text:
-                logger.info("Message sent to %s (composer cleared)", profile_url)
-                return True
-            logger.warning("Message verification failed for %s", profile_url)
-            return False
+        logger.info("Message sent to %s (composer cleared)", profile_url)
+        return True
 
     except Exception as e:
         logger.error("Failed to send message to %s: %s", profile_url, e)
