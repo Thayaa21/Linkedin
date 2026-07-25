@@ -1,14 +1,19 @@
 """
 drive.py — Fetches the shareable link for {Company}_Resume.pdf from Google Drive.
 
-Resumes must be named exactly:  Thayaa_{Company}.pdf
+Resumes must be named:  Thayaa_{Company}.pdf
 e.g.  Thayaa_Stripe.pdf, Thayaa_Google.pdf, Thayaa_Acme Corp.pdf
 
+Matching is simple and strict:
+  - Case-insensitive
+  - Strips spaces, punctuation, and common suffixes (LLC, Inc, Corp, etc.)
+  - Must be an EXACT match after cleaning — no fuzzy, no partial, no token tricks
+
 The Drive folder is set via DRIVE_FOLDER_ID in .env.
-Files must have "Anyone with the link can view" sharing already set —
-this script does NOT change sharing permissions.
+Files must have "Anyone with the link can view" sharing already set.
 """
 
+import re
 import logging
 from functools import lru_cache
 from googleapiclient.discovery import build
@@ -26,23 +31,27 @@ def _drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def _normalize(name: str) -> str:
-    """Strips extra whitespace and lowercases for comparison."""
-    return " ".join(name.lower().split())
-
-
-def _normalize_for_match(s: str) -> tuple[str, str]:
-    """Returns (spaced form, no-space form) for flexible matching."""
-    spaced = " ".join(s.lower().split())
-    nospace = spaced.replace(" ", "")
-    return spaced, nospace
+def _clean(name: str) -> str:
+    """
+    Normalize a company name for exact comparison:
+      - lowercase
+      - remove common corporate suffixes
+      - remove all punctuation and spaces
+    """
+    s = name.lower().strip()
+    # Remove common suffixes
+    for suffix in ('incorporated', 'inc', 'llc', 'ltd', 'limited', 'corp',
+                   'corporation', 'co', 'company', 'the'):
+        s = re.sub(r'\b' + suffix + r'\b', '', s)
+    # Remove all non-alphanumeric characters (spaces, dots, hyphens, underscores, etc.)
+    s = re.sub(r'[^a-z0-9]', '', s)
+    return s
 
 
 def get_resume_link(company: str) -> str | None:
     """
     Returns the webViewLink for Thayaa_{Company}.pdf, or None if not found.
-    Matching is flexible: case-insensitive, ignores extra spaces, and matches
-    "Newt Global" to "Thayaa_Newt Global.pdf" or "Thayaa_NewtGlobal.pdf".
+    Only matches if the cleaned company name is identical to the cleaned filename.
     """
     service = _drive_service()
     query = (
@@ -57,19 +66,21 @@ def get_resume_link(company: str) -> str | None:
     ).execute()
 
     files = results.get("files", [])
-    company_spaced, company_nospace = _normalize_for_match(company)
+    target = _clean(company)
+
+    if not target:
+        logger.warning("Empty company name after cleaning: '%s'", company)
+        return None
 
     for f in files:
-        name = f["name"].replace(".pdf", "").replace(".PDF", "")
-        if not name.lower().startswith("thayaa_"):
+        fname = f["name"].replace(".pdf", "").replace(".PDF", "")
+        if not fname.lower().startswith("thayaa_"):
             continue
-        file_company = name[7:].strip()  # after "thayaa_"
-        file_spaced, file_nospace = _normalize_for_match(file_company)
-        if (company_spaced == file_spaced or company_nospace == file_nospace or
-            company_spaced == file_nospace or company_nospace == file_spaced):
+        file_company = fname[7:]  # after "Thayaa_"
+        if _clean(file_company) == target:
             link = f.get("webViewLink")
-            logger.info("Found resume for %s: %s", company, link)
+            logger.info("Resume found for '%s' → %s", company, f["name"])
             return link
 
-    logger.warning("No resume found for company: %s (searched %d files)", company, len(files))
+    logger.warning("No resume found for '%s' (searched %d files)", company, len(files))
     return None
