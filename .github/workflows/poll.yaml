@@ -2,8 +2,12 @@ name: Poll LinkedIn Connections
 on:
   schedule:
     - cron: '0 */6 * * *'    # Poll every 6 hours
-    - cron: '0 16 * * *'     # Send at 9 AM MST daily (incl weekends)
   workflow_dispatch:
+
+# Never let two polls overlap
+concurrency:
+  group: linkedin-poll
+  cancel-in-progress: false
 
 jobs:
   poll:
@@ -32,11 +36,6 @@ jobs:
           CONNECTIONS_SNAPSHOT: connections_snapshot.json
         run: python -c "import asyncio; from main import poll_connections; asyncio.run(poll_connections())"
 
-      - name: Run send
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          SHEET_TAB: ${{ secrets.SHEET_TAB }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-          GOOGLE_CREDS_FILE: google_creds.json
-          COOKIES_FILE: linkedin_cookies.json
-        run: python -c "import asyncio; from main import send_messages; asyncio.run(send_messages())"
+      # NOTE: sending is intentionally NOT done here.
+      # send.yaml is the single owner of send_messages() — running it in both
+      # workflows caused the same person to be messaged twice.

@@ -4,6 +4,11 @@ on:
     - cron: '0 16 * * *'     # 9 AM MST (UTC-7), daily incl weekends
   workflow_dispatch:
 
+# This is the ONLY workflow that sends DMs. Never run two at once.
+concurrency:
+  group: linkedin-send
+  cancel-in-progress: false
+
 jobs:
   send:
     runs-on: ubuntu-latest
