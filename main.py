@@ -223,6 +223,15 @@ async def send_messages():
     Updates Status to Message Sent on success.
     """
     logger.info("=== send_messages started ===")
+
+    # Deduplicate first — remove duplicate rows that could cause double sends
+    try:
+        n = sheets.deduplicate_sent_sheet()
+        if n:
+            logger.info("Deduplicated Sent sheet: removed %d duplicate row(s)", n)
+    except Exception as e:
+        logger.warning("Could not deduplicate Sent sheet: %s", e)
+
     pending = sheets.get_pending_rows(include_no_resume=True)  # Retry No Resume when resume added to Drive
     logger.info("Rows to message (Pending + No Resume retry): %d", len(pending))
 
@@ -255,10 +264,20 @@ async def send_messages():
         li_name     = row["li_name"]
         first_name  = li_name.split()[0] if li_name else "there"
 
-        if sheets.normalize_li_url(profile_url) in already_sent:
+        # Re-check the sheet right before sending (catches cross-run duplicates)
+        li_norm = sheets.normalize_li_url(profile_url)
+        if li_norm in already_sent:
             logger.info("Skipping %s — already sent (duplicate row), marking as Message Sent", li_name)
             sheets.mark_sent_in_sent_sheet(row["row_index"])
             sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
+            continue
+
+        # Fresh check from sheet to catch if another run already sent this
+        fresh_sent = sheets.get_sent_li_urls()
+        if li_norm in fresh_sent:
+            logger.info("Skipping %s — already sent (detected from sheet refresh)", li_name)
+            sheets.mark_sent_in_sent_sheet(row["row_index"])
+            already_sent.add(li_norm)
             continue
 
         if not sheets.application_is_within_messaging_window(
