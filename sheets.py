@@ -417,8 +417,10 @@ def add_pending_to_sent_sheet(
     if not application_is_within_messaging_window(company, job_url):
         return
     li_norm = normalize_li_url(li_url)
-    # Never add if we've already contacted this person (any status — prevents duplicate messages)
-    if li_norm in get_tracked_li_urls():
+    # Never add if this person already exists in Sent sheet with ANY status
+    # This is the single gate that prevents all duplicate messages
+    tracked = get_tracked_li_urls()
+    if li_norm in tracked:
         return
     ensure_sent_sheet_exists()
     ws = _sent_worksheet()
@@ -426,10 +428,11 @@ def add_pending_to_sent_sheet(
     if not rows:
         ws.update("A1:F1", [SENT_HEADERS])
         rows = [SENT_HEADERS]
+    # Double-check with raw row scan (belt + suspenders)
     for row in rows[1:]:
         if len(row) > SENT_COL_LI_URL and row[SENT_COL_LI_URL].strip():
-            if normalize_li_url(row[SENT_COL_LI_URL]) == li_norm and (row[SENT_COL_COMPANY].strip() if len(row) > SENT_COL_COMPANY else "") == company.strip():
-                return  # already recorded (same person + company)
+            if normalize_li_url(row[SENT_COL_LI_URL]) == li_norm:
+                return  # person already exists — don't add regardless of company/role
     ws.append_row([li_name or "", company or "", li_url or "", job_url or "", role or "", STATUS_PENDING])
 
 
