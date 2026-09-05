@@ -327,7 +327,17 @@ async def send_messages():
             already_sent.add(sheets.normalize_li_url(profile_url))
             logger.info("Sent %d/%d: %s", i + 1, len(pending), li_name)
         else:
-            logger.warning("Failed to send to %s — will retry next run.", li_name)
+            # We issued the Send click but couldn't verify delivery. LinkedIn may
+            # have delivered it, so DO NOT leave the row Pending (that caused the
+            # same person to be messaged again on the next run). Mark it
+            # "Send Unverified" so it's excluded from auto-retry and surfaced for
+            # manual review instead.
+            sheets.mark_send_unverified_in_sent_sheet(row["row_index"])
+            already_sent.add(sheets.normalize_li_url(profile_url))
+            logger.warning(
+                "Could not verify send to %s — marked '%s' (no auto-retry, review manually).",
+                li_name, sheets.STATUS_SEND_UNVERIFIED,
+            )
 
         if i < len(pending) - 1:
             await asyncio.sleep(SEND_DELAY_SECONDS)

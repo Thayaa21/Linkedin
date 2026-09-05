@@ -729,18 +729,72 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
         await send_btn.evaluate("el => el.click()")
         await _pause(3, 5)
 
-        # Verify: composer should be empty if message was sent
-        try:
-            composer_text = await composer.evaluate("el => el.innerText.trim()")
-        except Exception:
-            composer_text = ""
+        # ── Verify send ──────────────────────────────────────────────────────
+        # Two independent signals; success if EITHER holds:
+        #   (a) the composer is now empty (LinkedIn clears it after a send), or
+        #   (b) our message text appears in the conversation thread.
+        # We re-query the composer fresh (the panel may have re-rendered, which
+        # would make the old `composer` handle stale and give a false negative —
+        # the bug that caused messages to be sent twice on consecutive days).
+        await _pause(1, 2)
 
-        if composer_text and len(composer_text) > 50:
-            logger.warning("Message NOT sent to %s — composer still has text", profile_url)
-            return False
+        # A snippet of the message that's very unlikely to appear elsewhere.
+        probe = ""
+        for line in message.splitlines():
+            line = line.strip()
+            if len(line) >= 20:
+                probe = line[:60]
+                break
+        if not probe:
+            probe = message.strip()[:60]
 
-        logger.info("Message sent to %s (composer cleared)", profile_url)
-        return True
+        verified = await page.evaluate(
+            """(probe) => {
+                const composerSelectors = [
+                    '.msg-form__contenteditable',
+                    ".msg-form [contenteditable='true']",
+                    ".msg-overlay-conversation-bubble [contenteditable='true']",
+                    "[role='textbox']",
+                ];
+                let composerText = null;
+                for (const sel of composerSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { composerText = (el.innerText || '').trim(); break; }
+                }
+                // Signal (a): composer exists and is now empty/short.
+                const composerCleared = composerText !== null && composerText.length <= 5;
+
+                // Signal (b): our message shows up in the rendered thread.
+                let inThread = false;
+                if (probe) {
+                    const bodies = document.querySelectorAll(
+                        '.msg-s-event-listitem__body, .msg-s-message-list__event, .msg-s-event-listitem'
+                    );
+                    for (const b of bodies) {
+                        if ((b.innerText || '').includes(probe)) { inThread = true; break; }
+                    }
+                }
+                return { composerCleared, inThread, hadComposer: composerText !== null };
+            }""",
+            probe,
+        )
+
+        composer_cleared = bool(verified and verified.get("composerCleared"))
+        in_thread = bool(verified and verified.get("inThread"))
+
+        if in_thread or composer_cleared:
+            logger.info(
+                "Message sent to %s (in_thread=%s, composer_cleared=%s)",
+                profile_url, in_thread, composer_cleared,
+            )
+            return True
+
+        logger.warning(
+            "Could not verify send to %s (in_thread=%s, composer_cleared=%s, had_composer=%s)",
+            profile_url, in_thread, composer_cleared,
+            bool(verified and verified.get("hadComposer")),
+        )
+        return False
 
     except Exception as e:
         logger.error("Failed to send message to %s: %s", profile_url, e)
