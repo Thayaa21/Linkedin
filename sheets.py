@@ -35,9 +35,6 @@ STATUS_SENT             = "Message Sent"
 STATUS_NO_RESUME        = "No Resume"
 STATUS_ALREADY_MESSAGED = "Already Messaged"
 STATUS_OUTSIDE_MESSAGE_WINDOW = "Outside Message Window"
-# We clicked Send but could not verify delivery. Treated as already-attempted so
-# we never auto-resend (LinkedIn may have delivered it). Requires manual review.
-STATUS_SEND_UNVERIFIED = "Send Unverified"
 
 # Tracker column F: derived from Applied Date + MESSAGE_APPLY_WITHIN_DAYS (updated every poll)
 OUTREACH_STILL_WORKING = "Still working"
@@ -497,15 +494,6 @@ def mark_outside_message_window_in_sent_sheet(row_index: int):
     """Sent sheet row is not messaged because application is outside the configured day window."""
     ws = _sent_worksheet()
     ws.update_cell(row_index, SENT_COL_STATUS + 1, STATUS_OUTSIDE_MESSAGE_WINDOW)
-
-
-def mark_send_unverified_in_sent_sheet(row_index: int):
-    """
-    Row: we clicked Send but couldn't confirm delivery. Do NOT auto-resend
-    (LinkedIn may have delivered it). Left for manual review.
-    """
-    ws = _sent_worksheet()
-    ws.update_cell(row_index, SENT_COL_STATUS + 1, STATUS_SEND_UNVERIFIED)
 
 
 def mark_person_as_sent(li_url: str | None = None, name: str | None = None) -> bool:

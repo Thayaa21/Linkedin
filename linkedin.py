@@ -183,13 +183,26 @@ async def get_connections(page: Page, old_snapshot: dict | None = None) -> dict[
     # Scroll down so LinkedIn lazy-loads the rest of the connection cards.
     # Each scroll triggers LinkedIn's own API calls for mini-profiles, which
     # our interceptor captures (including current company / position data).
-    logger.info("Scrolling to trigger lazy-loaded profile API calls...")
-    for scroll_i in range(12):
-        await page.evaluate("window.scrollBy(0, 600)")
+    # Scroll purely to enrich company/position data via intercepted traffic.
+    # It is NOT the source of truth for WHO your connections are — the Voyager
+    # API pagination below is. Previously we capped this at 45 profiles and used
+    # it as the primary source, so connection #46+ never made it into the
+    # snapshot. Keep scrolling until the page stops growing (no early count cap).
+    logger.info("Scrolling to enrich profile data via intercepted API calls...")
+    stagnant = 0
+    last_count = 0
+    for scroll_i in range(40):
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await asyncio.sleep(1.2)
-        if len(intercepted_profiles) >= 45:
-            logger.info("Enough profiles collected (%d), stopping scroll", len(intercepted_profiles))
-            break
+        cur = len(intercepted_profiles)
+        if cur == last_count:
+            stagnant += 1
+            if stagnant >= 4:
+                logger.info("Scroll stagnant at %d profiles — stopping scroll", cur)
+                break
+        else:
+            stagnant = 0
+            last_count = cur
 
     await _pause(2, 3)  # final wait for any in-flight requests
 
@@ -199,20 +212,25 @@ async def get_connections(page: Page, old_snapshot: dict | None = None) -> dict[
         len(intercepted_positions), len(intercepted_companies),
     )
 
-    # ── Step 3: If scrolling didn't yield profiles, fall back to API ──────────
+    # ── Step 3: Always walk the full connection list via the Voyager API ──────
+    # This is the authoritative, COMPLETE source of who your connections are.
+    # It paginates through every page in RECENTLY_ADDED order until an empty/
+    # short page. We no longer gate this on interception failing, and we no
+    # longer stop early on the first already-known profile — that early-exit
+    # (plus the old scroll cap) is exactly why some connections never landed in
+    # the snapshot. The Python-side diff dedups against the existing snapshot.
     known_urls = [_normalize_url(u) for u in old_snapshot.keys()]
-    if len(intercepted_profiles) < 5:
-        logger.info("Still few profiles after scroll — calling Voyager API directly...")
+    if True:
+        logger.info("Walking full connection list via Voyager API...")
         api_result = await page.evaluate("""
             async ({csrfToken, knownUrls}) => {
                 const PAGE_SIZE = 50;
-                const knownSet = new Set((knownUrls || []).map(u => u.toLowerCase()));
-                const hasExisting = knownSet.size > 0;
+                const MAX_PAGES = 60;  // safety cap (~3000 connections)
                 let allProfiles = {};
                 let start = 0;
-                let hitExisting = false;
+                let pages = 0;
 
-                while (true) {
+                while (pages < MAX_PAGES) {
                     const connResp = await fetch(
                         '/voyager/api/relationships/dash/connections?count=' + PAGE_SIZE + '&start=' + start + '&q=search&sortType=RECENTLY_ADDED',
                         {
@@ -259,15 +277,11 @@ async def get_connections(page: Page, old_snapshot: dict | None = None) -> dict[
                                 for (const item of (profiles.included || [])) {
                                     if (item && item.publicIdentifier) {
                                         allProfiles[item.publicIdentifier] = item;
-                                        const urlNorm = 'linkedin.com/in/' + item.publicIdentifier.toLowerCase();
-                                        if (knownSet.has(urlNorm)) hitExisting = true;
                                     }
                                 }
                                 for (const item of Object.values(profiles.results || {})) {
                                     if (item && item.publicIdentifier) {
                                         allProfiles[item.publicIdentifier] = item;
-                                        const urlNorm = 'linkedin.com/in/' + item.publicIdentifier.toLowerCase();
-                                        if (knownSet.has(urlNorm)) hitExisting = true;
                                     }
                                 }
                                 got = true;
@@ -277,31 +291,44 @@ async def get_connections(page: Page, old_snapshot: dict | None = None) -> dict[
                     }
                     if (!got) break;
 
-                    console.log('Connection URNs this page: ' + memberUrns.length + ', hitExisting: ' + hitExisting);
-                    if (hitExisting || memberUrns.length < PAGE_SIZE) break;
-                    if (!hasExisting) break;
+                    pages += 1;
+                    console.log('Page ' + pages + ': ' + memberUrns.length + ' URNs, total profiles=' + Object.keys(allProfiles).length);
+                    // Keep going until a short/empty page (end of the list).
+                    // We intentionally do NOT stop on already-known profiles —
+                    // we want the complete set every run so nobody is skipped.
+                    if (memberUrns.length < PAGE_SIZE) break;
                     start += PAGE_SIZE;
                     await new Promise(r => setTimeout(r, 800));
                 }
 
-                return { ok: true, profiles: { included: Object.values(allProfiles) } };
+                return { ok: true, profiles: { included: Object.values(allProfiles) }, pages };
             }
         """, {"csrfToken": csrf_token, "knownUrls": known_urls})
 
         if api_result and api_result.get("ok"):
             profiles_raw = api_result.get("profiles") or {}
+
+            def _merge_profile(item):
+                # Don't clobber a richer intercepted profile with a sparser API one.
+                pid = item.get("publicIdentifier", "")
+                if not pid:
+                    return
+                existing = intercepted_profiles.get(pid)
+                if existing is None or len(item) >= len(existing):
+                    intercepted_profiles[pid] = item
+
             for item in (profiles_raw.get("included") or []):
                 if isinstance(item, dict):
-                    pid = item.get("publicIdentifier", "")
-                    if pid:
-                        intercepted_profiles[pid] = item
+                    _merge_profile(item)
             for item in (profiles_raw.get("results") or {}).values():
                 if isinstance(item, dict):
-                    pid = item.get("publicIdentifier", "")
-                    if pid:
-                        intercepted_profiles[pid] = item
+                    _merge_profile(item)
 
-        logger.info("After API fallback: %d profiles collected", len(intercepted_profiles))
+        logger.info(
+            "After Voyager API walk (%s pages): %d total profiles collected",
+            api_result.get("pages", "?") if api_result else "?",
+            len(intercepted_profiles),
+        )
 
     # ── Step 4: Build connections dict (merge old_snapshot + newly fetched) ────
     connections: dict[str, dict] = dict(old_snapshot)
@@ -782,19 +809,24 @@ async def send_message(page: Page, profile_url: str, message: str) -> bool:
         composer_cleared = bool(verified and verified.get("composerCleared"))
         in_thread = bool(verified and verified.get("inThread"))
 
+        # The Send click already went through above. Verification is only a
+        # confidence check — LinkedIn's post-send DOM re-render often makes the
+        # checks read false even when the message WAS delivered. Since a false
+        # negative here forces a resend (the double-message bug), we treat the
+        # successful click as the source of truth and always report success.
+        # Priority: never send twice > perfectly confirm every send.
         if in_thread or composer_cleared:
             logger.info(
-                "Message sent to %s (in_thread=%s, composer_cleared=%s)",
+                "Message sent to %s (verified: in_thread=%s, composer_cleared=%s)",
                 profile_url, in_thread, composer_cleared,
             )
-            return True
-
-        logger.warning(
-            "Could not verify send to %s (in_thread=%s, composer_cleared=%s, had_composer=%s)",
-            profile_url, in_thread, composer_cleared,
-            bool(verified and verified.get("hadComposer")),
-        )
-        return False
+        else:
+            logger.warning(
+                "Send clicked for %s but could not visually confirm "
+                "(in_thread=%s, composer_cleared=%s). Treating as sent to avoid a duplicate.",
+                profile_url, in_thread, composer_cleared,
+            )
+        return True
 
     except Exception as e:
         logger.error("Failed to send message to %s: %s", profile_url, e)
