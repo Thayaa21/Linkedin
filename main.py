@@ -147,8 +147,16 @@ async def poll_connections():
         ):
             added += 1
             logger.info("  queued: %s → %s @ %s", name, matched["role"], matched["company"])
+            # Persist the snapshot right after adding a Sent row so the two can
+            # never drift apart. Previously a mid-run crash left people in the
+            # Sent sheet but missing from the snapshot — so they looked "new"
+            # forever and could be re-matched/re-messaged.
+            try:
+                sheets.save_snapshot_to_sheet(snapshot)
+            except Exception as e:
+                logger.warning("Snapshot save after queueing %s failed: %s", name, e)
 
-    # ── Save snapshot ONCE ─────────────────────────────────────────────────────
+    # ── Final snapshot save (captures everyone seen, matched or not) ───────────
     sheets.save_snapshot_to_sheet(snapshot)
     logger.info("Snapshot saved: %d connections | %d new pending rows", len(snapshot), added)
     logger.info("=== poll_connections complete ===")

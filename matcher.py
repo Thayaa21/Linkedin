@@ -18,6 +18,21 @@ from config import FUZZY_THRESHOLD, OPENAI_API_KEY, OPENAI_MODEL
 
 logger = logging.getLogger(__name__)
 
+# Generic words that must NOT drive a company match on their own. "AI" matching
+# "Simple AI" is exactly what messaged the wrong people.
+_GENERIC_TOKENS = {
+    "ai", "ml", "the", "inc", "llc", "ltd", "co", "corp", "corporation", "company",
+    "labs", "lab", "technologies", "technology", "tech", "systems", "system",
+    "solutions", "solution", "software", "group", "global", "services", "data",
+    "digital", "consulting", "studio", "studios", "and", "of",
+}
+
+
+def _tokens(s: str) -> set[str]:
+    """Lowercase alphanumeric tokens of a company string."""
+    return {t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if t}
+
+
 # ─── GPT-4o-mini extraction ───────────────────────────────────────────────────
 
 _openai_client = None
@@ -145,32 +160,57 @@ def find_matching_row(
             logger.info("Matched '%s' → '%s' (exact)", connection_company, row["company"])
             return row
 
-    # 2) Sheet company appears as a whole word inside the extracted text
+    # 2) Full sheet company appears as consecutive whole words in the extracted
+    #    text. Skip when the sheet company is only generic tokens (e.g. "AI"),
+    #    which would otherwise match almost any AI-flavored headline.
     for row in sheet_rows:
         sheet_company = row["company"].strip()
         if not sheet_company:
+            continue
+        if _tokens(sheet_company) <= _GENERIC_TOKENS:
             continue
         pattern = r"\b" + re.escape(sheet_company) + r"\b"
         if re.search(pattern, connection_company, re.IGNORECASE):
             logger.info("Matched '%s' → '%s' (contains)", connection_company, sheet_company)
             return row
 
-    # 3) Fuzzy
+    # 3) Fuzzy — but guarded against generic single-token false positives.
+    #
+    #    The classic bug: extracting "AI" from a headline scored token_set_ratio
+    #    100 against a sheet company like "Simple AI" (the shared "AI" token is a
+    #    subset), so unrelated people were matched. Guards:
+    #      - require token_sort_ratio (order-sensitive, not subset-generous),
+    #      - require the connection company to share a DISTINCTIVE token with the
+    #        sheet company (not just a generic word like "ai"/"the"/"labs").
+    conn_tokens = _tokens(connection_company)
+    if not conn_tokens or conn_tokens <= _GENERIC_TOKENS:
+        # Nothing but generic words ("ai", "inc", ...) — never fuzzy-match on that.
+        return None
+
     choices = {row["company"]: row for row in sheet_rows if row.get("company")}
     if not choices:
         return None
-    result = process.extractOne(
-        connection_company, choices.keys(), scorer=fuzz.token_set_ratio,
-    )
-    if result is None:
-        return None
-    best_match, score, _ = result
-    if score >= FUZZY_THRESHOLD:
-        logger.info("Matched '%s' → '%s' (score=%d)", connection_company, best_match, score)
+
+    best_match = None
+    best_score = 0.0
+    for company in choices:
+        sort_score = fuzz.token_sort_ratio(connection_company, company)
+        set_score = fuzz.token_set_ratio(connection_company, company)
+        # Distinctive (non-generic) token overlap is REQUIRED.
+        sheet_tokens = _tokens(company)
+        distinctive_overlap = (conn_tokens & sheet_tokens) - _GENERIC_TOKENS
+        if not distinctive_overlap:
+            continue
+        score = min(sort_score, set_score)  # both must be high
+        if score > best_score:
+            best_score, best_match = score, company
+
+    if best_match and best_score >= FUZZY_THRESHOLD:
+        logger.info("Matched '%s' → '%s' (score=%.0f)", connection_company, best_match, best_score)
         return choices[best_match]
 
     logger.debug(
-        "No match for '%s' (best '%s' score=%d < %d)",
-        connection_company, best_match, score, FUZZY_THRESHOLD,
+        "No confident match for '%s' (best '%s' score=%.0f < %d)",
+        connection_company, best_match, best_score, FUZZY_THRESHOLD,
     )
     return None
