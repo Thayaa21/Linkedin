@@ -34,6 +34,11 @@ jobs:
           GOOGLE_CREDS_FILE: google_creds.json
           COOKIES_FILE: linkedin_cookies.json
           CONNECTIONS_SNAPSHOT: connections_snapshot.json
+          # GPT-4o-mini company extraction (poll only). Falls back to regex if unset.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4o-mini
+          MAX_POLL_CONNECTIONS: '100'
+          MESSAGE_APPLY_WITHIN_DAYS: '12'
         run: python -c "import asyncio; from main import poll_connections; asyncio.run(poll_connections())"
 
       # NOTE: sending is intentionally NOT done here.
