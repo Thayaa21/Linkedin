@@ -10,11 +10,14 @@ Sent Messages layout (people we've messaged):
 """
 
 import re
+import logging
 from datetime import date, datetime, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
 from config import SHEET_ID, SHEET_TAB, SENT_TAB, GOOGLE_CREDS_FILE, MESSAGE_APPLY_WITHIN_DAYS
+
+logger = logging.getLogger(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -63,13 +66,55 @@ SENT_COL_STATUS = 5
 SENT_HEADERS = ["Name", "Company", "LinkedIn ID", "Job URL", "Role", "Status"]
 
 
+import time
+import random
+
+# ── Cached client / spreadsheet / worksheet handles ───────────────────────────
+# Previously every call re-authorized AND re-opened the spreadsheet over the
+# network. In a loop over many connections that blew Google's 60 reads/min
+# quota (HTTP 429) and crashed the poll. We cache all three and add backoff.
+_client_cache = None
+_spreadsheet_cache = None
+_worksheet_cache: dict[str, object] = {}
+
+
 def _client():
-    creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=SCOPES)
-    return gspread.authorize(creds)
+    global _client_cache
+    if _client_cache is None:
+        creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=SCOPES)
+        _client_cache = gspread.authorize(creds)
+    return _client_cache
+
+
+def _spreadsheet():
+    global _spreadsheet_cache
+    if _spreadsheet_cache is None:
+        _spreadsheet_cache = _client().open_by_key(SHEET_ID)
+    return _spreadsheet_cache
+
+
+def _with_backoff(fn, *args, **kwargs):
+    """Run a gspread call, retrying on 429 (quota) with exponential backoff."""
+    delay = 2.0
+    for attempt in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 429 and attempt < 5:
+                sleep_for = delay + random.uniform(0, 1)
+                logger.warning("Sheets 429 — backing off %.1fs (attempt %d)", sleep_for, attempt + 1)
+                time.sleep(sleep_for)
+                delay *= 2
+                continue
+            raise
+    return fn(*args, **kwargs)
 
 
 def _worksheet():
-    return _client().open_by_key(SHEET_ID).worksheet(SHEET_TAB)
+    if SHEET_TAB not in _worksheet_cache:
+        _worksheet_cache[SHEET_TAB] = _spreadsheet().worksheet(SHEET_TAB)
+    return _worksheet_cache[SHEET_TAB]
 
 
 # Sheets / Excel serial days: day N is this many days after 1899-12-30 (45292 → 2024-01-01).
@@ -189,7 +234,7 @@ def refresh_tracker_outreach_column():
 
 def ensure_sent_sheet_exists():
     """Create Sent Messages sheet with header row (title) if it doesn't exist."""
-    spreadsheet = _client().open_by_key(SHEET_ID)
+    spreadsheet = _spreadsheet()
     try:
         ws = spreadsheet.worksheet(SENT_TAB)
     except gspread.exceptions.WorksheetNotFound:
@@ -203,7 +248,9 @@ def ensure_sent_sheet_exists():
 
 
 def _sent_worksheet():
-    return _client().open_by_key(SHEET_ID).worksheet(SENT_TAB)
+    if SENT_TAB not in _worksheet_cache:
+        _worksheet_cache[SENT_TAB] = _spreadsheet().worksheet(SENT_TAB)
+    return _worksheet_cache[SENT_TAB]
 
 
 def refine_tracker_sheet():
@@ -356,6 +403,68 @@ def get_applied_date_for_application(company: str, job_url: str) -> str | None:
     return max(dated)
 
 
+def load_tracker_index() -> dict:
+    """
+    Read the whole Tracker ONCE and return a lookup structure for matching /
+    window checks without further network reads. Shape:
+      {
+        "by_job":     { normalized_job_url: applied_date_str },
+        "by_company": { company_lower: [applied_date_str, ...] },
+        "rows":       [ {row_index, company, role, url, status, timestamp}, ... ],
+      }
+    """
+    ws = _worksheet()
+    records = _with_backoff(ws.get_all_values)
+    by_job: dict[str, str] = {}
+    by_company: dict[str, list[str]] = {}
+    rows: list[dict] = []
+    for i, row in enumerate(records[1:], start=2):
+        if len(row) < 5:
+            continue
+        company = row[COL_COMPANY].strip() if len(row) > COL_COMPANY else ""
+        role = row[COL_ROLE].strip() if len(row) > COL_ROLE else ""
+        job_url = row[COL_URL].strip() if len(row) > COL_URL else ""
+        status = row[COL_STATUS].strip() if len(row) > COL_STATUS else ""
+        ts = _to_applied_date(row[COL_APPLIED_DATE].strip() if len(row) > COL_APPLIED_DATE else "")
+        rows.append({
+            "row_index": i, "company": company, "role": role,
+            "url": job_url, "status": status, "timestamp": ts,
+        })
+        if job_url and ts:
+            by_job[normalize_job_url(job_url)] = ts
+        if company and ts:
+            by_company.setdefault(company.lower(), []).append(ts)
+    return {"by_job": by_job, "by_company": by_company, "rows": rows}
+
+
+def applied_date_from_index(index: dict, company: str, job_url: str) -> str | None:
+    """Applied date (YYYY-MM-DD) for a company/job using a preloaded tracker index."""
+    if not company:
+        return None
+    want_job = normalize_job_url(job_url)
+    if want_job and want_job in index["by_job"]:
+        return index["by_job"][want_job]
+    dates = index["by_company"].get(company.strip().lower(), [])
+    dated = [d for d in dates if d]
+    return max(dated) if dated else None
+
+
+def within_window_from_index(
+    index: dict, company: str, job_url: str, max_days: int | None = None,
+) -> bool:
+    """Window check using a preloaded tracker index (no network read)."""
+    limit = MESSAGE_APPLY_WITHIN_DAYS if max_days is None else max_days
+    if limit < 0:
+        limit = 0
+    applied = applied_date_from_index(index, company, job_url)
+    if not applied:
+        return False
+    applied_d = _parse_applied_date_to_date(applied)
+    if not applied_d:
+        return False
+    return _applied_date_in_outreach_window(applied_d, limit)
+
+
 def application_is_within_messaging_window(
     company: str, job_url: str, max_days: int | None = None,
 ) -> bool:
@@ -410,30 +519,39 @@ def add_pending_to_sent_sheet(
     company: str,
     role: str,
     job_url: str,
-):
-    """Add a row to Sent sheet with Status=Pending (when we match a connection)."""
+    tracked_urls: set[str] | None = None,
+    check_window: bool = True,
+) -> bool:
+    """
+    Add a row to Sent sheet with Status=Pending (when we match a connection).
+
+    tracked_urls: pass a pre-fetched set of normalized LinkedIn URLs already in
+      the Sent sheet to avoid a full-sheet read on every call (the old behavior
+      that blew the Sheets quota in a loop). If provided, it is updated in place
+      when a new row is added.
+
+    Returns True if a row was added, else False.
+    """
     if not li_url or not li_url.strip():
-        return
-    if not application_is_within_messaging_window(company, job_url):
-        return
+        return False
+    if check_window and not application_is_within_messaging_window(company, job_url):
+        return False
+
     li_norm = normalize_li_url(li_url)
-    # Never add if this person already exists in Sent sheet with ANY status
-    # This is the single gate that prevents all duplicate messages
-    tracked = get_tracked_li_urls()
+    # Single gate that prevents duplicate messages: skip if the person is already
+    # in the Sent sheet with ANY status.
+    tracked = tracked_urls if tracked_urls is not None else get_tracked_li_urls()
     if li_norm in tracked:
-        return
+        return False
+
     ensure_sent_sheet_exists()
     ws = _sent_worksheet()
-    rows = ws.get_all_values()
-    if not rows:
-        ws.update("A1:F1", [SENT_HEADERS])
-        rows = [SENT_HEADERS]
-    # Double-check with raw row scan (belt + suspenders)
-    for row in rows[1:]:
-        if len(row) > SENT_COL_LI_URL and row[SENT_COL_LI_URL].strip():
-            if normalize_li_url(row[SENT_COL_LI_URL]) == li_norm:
-                return  # person already exists — don't add regardless of company/role
-    ws.append_row([li_name or "", company or "", li_url or "", job_url or "", role or "", STATUS_PENDING])
+    _with_backoff(
+        ws.append_row,
+        [li_name or "", company or "", li_url or "", job_url or "", role or "", STATUS_PENDING],
+    )
+    tracked.add(li_norm)
+    return True
 
 
 def get_pending_rows(include_no_resume: bool = True) -> list[dict]:
@@ -637,8 +755,8 @@ SNAPSHOT_HEADERS = ["Profile URL", "Name", "Headline", "Company"]
 def load_snapshot_from_sheet() -> dict[str, dict]:
     """Load connections snapshot. Supports both old (JSON) and new (columns) format."""
     try:
-        ws = _client().open_by_key(SHEET_ID).worksheet(SNAPSHOT_TAB)
-        rows = ws.get_all_values()
+        ws = _spreadsheet().worksheet(SNAPSHOT_TAB)
+        rows = _with_backoff(ws.get_all_values)
         result = {}
         for row in rows:
             if not row or not row[0].strip():
@@ -666,7 +784,7 @@ def load_snapshot_from_sheet() -> dict[str, dict]:
 
 def save_snapshot_to_sheet(connections: dict[str, dict]):
     """Persist snapshot with clean columns: URL, Name, Headline, Company."""
-    spreadsheet = _client().open_by_key(SHEET_ID)
+    spreadsheet = _spreadsheet()
     try:
         ws = spreadsheet.worksheet(SNAPSHOT_TAB)
     except gspread.exceptions.WorksheetNotFound:

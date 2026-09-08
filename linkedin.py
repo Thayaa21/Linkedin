@@ -408,6 +408,148 @@ async def get_connections(page: Page, old_snapshot: dict | None = None) -> dict[
     return connections
 
 
+# ─── Recent connections (lightweight poll) ────────────────────────────────────
+
+async def get_recent_connections(
+    page: Page,
+    max_connections: int = 100,
+    known_urls: set[str] | None = None,
+) -> list[dict]:
+    """
+    Fetch the most recently-added connections (RECENTLY_ADDED order), up to
+    `max_connections`. Returns a list of dicts:
+        {"name", "headline", "url", "public_identifier"}
+
+    Only connections whose normalized URL is NOT in `known_urls` are returned,
+    so callers can process just the genuinely new people. This is the lightweight
+    path used by the poll — it does a bounded number of Voyager API pages instead
+    of walking the entire connection list.
+    """
+    known_urls = known_urls or set()
+
+    logger.info("Establishing LinkedIn session for recent-connections fetch...")
+    await page.goto(f"{LINKEDIN_BASE}/mynetwork/", wait_until="domcontentloaded")
+    await _pause(2, 4)
+
+    cookies = await page.context.cookies()
+    csrf_token = next(
+        (c["value"].strip('"') for c in cookies if c["name"] == "JSESSIONID"), "",
+    )
+    if not csrf_token:
+        logger.error("JSESSIONID cookie missing. Re-run save_cookies.py.")
+        return []
+
+    # Land on the connections page so same-origin fetches are allowed.
+    await page.goto(CONNECTIONS_URL, wait_until="domcontentloaded")
+    await _pause(2, 4)
+
+    raw = await page.evaluate(
+        """async ({csrfToken, maxCount}) => {
+            const PAGE_SIZE = 40;
+            const headers = {
+                'Accept': 'application/vnd.linkedin.normalized+json+2.1',
+                'csrf-token': csrfToken,
+                'x-restli-protocol-version': '2.0.0',
+            };
+            const out = [];
+            let start = 0;
+            while (out.length < maxCount) {
+                const connResp = await fetch(
+                    '/voyager/api/relationships/dash/connections?count=' + PAGE_SIZE +
+                    '&start=' + start + '&q=search&sortType=RECENTLY_ADDED',
+                    { headers, credentials: 'include' }
+                );
+                if (!connResp.ok) return { ok: false, error: 'connections ' + connResp.status, out };
+                const connData = JSON.parse(await connResp.text());
+                const included = connData.included || [];
+
+                const memberUrns = included
+                    .filter(e => e.$type && e.$type.toLowerCase().includes('connection') && e.connectedMember)
+                    .map(e => e.connectedMember);
+                if (!memberUrns.length) break;
+
+                // Build a profile lookup from this page's included objects.
+                const profByUrn = {};
+                const profByPid = {};
+                for (const item of included) {
+                    if (item && item.publicIdentifier) {
+                        if (item.entityUrn) profByUrn[item.entityUrn] = item;
+                        profByPid[item.publicIdentifier] = item;
+                    }
+                }
+
+                // If the connection page didn't inline profiles, fetch them.
+                let profiles = Object.values(profByPid);
+                if (!profiles.length) {
+                    const ids = memberUrns.map(u => u.split(':').pop()).map(encodeURIComponent).join(',');
+                    for (const ep of [
+                        '/voyager/api/identity/dash/profiles?ids=List(' + memberUrns.map(encodeURIComponent).join(',') + ')',
+                        '/voyager/api/identity/profiles?ids=List(' + ids + ')',
+                    ]) {
+                        try {
+                            const r = await fetch(ep, { headers, credentials: 'include' });
+                            if (r.ok) {
+                                const d = JSON.parse(await r.text());
+                                for (const it of (d.included || [])) {
+                                    if (it && it.publicIdentifier) profiles.push(it);
+                                }
+                                if (profiles.length) break;
+                            }
+                        } catch (e) {}
+                    }
+                }
+
+                for (const p of profiles) {
+                    if (!p.publicIdentifier) continue;
+                    const first = p.firstName || '';
+                    const last = p.lastName || '';
+                    out.push({
+                        publicIdentifier: p.publicIdentifier,
+                        name: (first + ' ' + last).trim(),
+                        headline: p.headline || '',
+                    });
+                    if (out.length >= maxCount) break;
+                }
+
+                if (memberUrns.length < PAGE_SIZE) break;
+                start += PAGE_SIZE;
+                await new Promise(r => setTimeout(r, 700));
+            }
+            return { ok: true, out };
+        }""",
+        {"csrfToken": csrf_token, "maxCount": max_connections},
+    )
+
+    if not raw or not raw.get("ok"):
+        logger.error("Recent-connections fetch failed: %s", raw and raw.get("error"))
+        return []
+
+    seen_pids: set[str] = set()
+    results: list[dict] = []
+    for item in raw.get("out", []):
+        pid = (item.get("publicIdentifier") or "").strip()
+        if not pid or pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        name = (item.get("name") or "").strip()
+        if not name or len(name) < 2 or name.lower() in ("dom", "nil", "null", "undefined"):
+            continue
+        url = f"{LINKEDIN_BASE}/in/{pid}"
+        if _normalize_url(url) in known_urls:
+            continue
+        results.append({
+            "public_identifier": pid,
+            "name": name,
+            "headline": (item.get("headline") or "").strip(),
+            "url": url,
+        })
+
+    logger.info(
+        "Recent connections fetched: %d (new after snapshot filter)", len(results),
+    )
+    return results
+
+
 # ─── Profile company lookup ──────────────────────────────────────────────────
 
 async def get_csrf_token(page: Page) -> str:

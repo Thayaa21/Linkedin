@@ -26,6 +26,15 @@ SEND_HOUR           = int(os.environ.get('SEND_HOUR', '9'))   # 9 AM local time
 # Only queue / send DMs for applications whose Tracker "Applied Date" is within this many days (inclusive).
 MESSAGE_APPLY_WITHIN_DAYS = int(os.environ.get('MESSAGE_APPLY_WITHIN_DAYS', '12'))
 
+# Poll only the most-recently-added connections (RECENTLY_ADDED order).
+# Anyone already in the snapshot is skipped, so this is just how far back we look.
+MAX_POLL_CONNECTIONS = int(os.environ.get('MAX_POLL_CONNECTIONS', '100'))
+
+# ─── OpenAI (company extraction from LinkedIn headline) ───────────────────────
+# Optional. If unset or the call fails, we fall back to a simple regex parser.
+OPENAI_API_KEY   = os.environ.get('OPENAI_API_KEY', '')
+OPENAI_MODEL     = os.environ.get('OPENAI_MODEL', 'gpt-4o-mini')
+
 # ─── Message template ─────────────────────────────────────────────────────────
 # Available placeholders: {first_name} {company} {role} {resume_link}
 MESSAGE_TEMPLATE = os.environ.get('MESSAGE_TEMPLATE', """\

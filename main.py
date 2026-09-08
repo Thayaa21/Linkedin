@@ -3,13 +3,16 @@ main.py — Scheduler entry point.
 
 Two jobs run on separate schedules:
   1. poll_connections()   — every POLL_INTERVAL_HOURS hours
-                            Scrapes LinkedIn connections, diffs vs snapshot,
-                            matches new connections to sheet companies,
-                            adds matches to Sent sheet (Pending).
+                            Fetches the most-recent MAX_POLL_CONNECTIONS
+                            connections, skips anyone already in the snapshot,
+                            extracts each new person's company (GPT-4o-mini with
+                            regex fallback), matches to the Tracker, and queues
+                            in-window matches to the Sent sheet (Pending).
 
   2. send_messages()      — weekdays at SEND_HOUR (default 9 AM)
-                            Sends DMs to all Pending rows in Sent sheet,
-                            updates Status to Message Sent.
+                            Sends one DM per Pending row within the 12-day
+                            window, then marks Message Sent in BOTH the Sent
+                            sheet and the Tracker.
 
 Usage:
     python main.py
@@ -27,7 +30,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 from playwright.async_api import async_playwright
 
 import sheets
-from sheets import STATUS_APPLIED
 import drive
 import linkedin as li
 import matcher as m
@@ -36,6 +38,7 @@ from config import (
     SEND_HOUR,
     MESSAGE_TEMPLATE,
     MESSAGE_APPLY_WITHIN_DAYS,
+    MAX_POLL_CONNECTIONS,
 )
 
 logging.basicConfig(
@@ -50,168 +53,104 @@ logger = logging.getLogger("main")
 
 async def poll_connections():
     """
-    Scrapes current LinkedIn 1st-degree connections, diffs against the last
-    snapshot, and for each match adds a row to Sent sheet (Pending).
+    Fetch the most-recent connections, skip anyone already in the snapshot,
+    extract each new person's company (GPT-4o-mini), match to the Tracker, and
+    add matches within the 12-day window to the Sent sheet as Pending.
+
+    Reads the Tracker and Sent sheet ONCE each (not per connection) to stay well
+    under Google's per-minute quota.
     """
     logger.info("=== poll_connections started ===")
 
-    # Ensure Sent sheet exists (creates 3rd tab)
+    # Ensure Sent sheet exists; refresh tracker's outreach column once.
     try:
         sheets.ensure_sent_sheet_exists()
-        logger.info("Sent sheet ensured")
     except Exception as e:
         logger.warning("Could not ensure Sent sheet: %s", e)
-
-    # Remove duplicate rows (e.g. same person twice — keep Message Sent)
-    try:
-        n = sheets.deduplicate_sent_sheet()
-        if n:
-            logger.info("Deduplicated Sent sheet: removed %d duplicate row(s)", n)
-    except Exception as e:
-        logger.warning("Could not deduplicate Sent sheet: %s", e)
-
-    # Refine tracker: timestamp→date, 6 cols (incl. Outreach window)
-    try:
-        sheets.refine_tracker_sheet()
-        logger.info("Tracker sheet refined (6 columns incl. Outreach window)")
-    except Exception as e:
-        logger.warning("Could not refine tracker: %s", e)
-
     try:
         sheets.refresh_tracker_outreach_column()
-        logger.info("Tracker Outreach window column refreshed")
     except Exception as e:
         logger.warning("Could not refresh tracker outreach column: %s", e)
 
+    # ── Load sheet state ONCE ──────────────────────────────────────────────────
+    snapshot = sheets.load_snapshot_from_sheet()
+    known_urls = {sheets.normalize_li_url(u) for u in snapshot.keys()}
+    logger.info("Snapshot: %d previously seen connections", len(snapshot))
+
+    tracker = sheets.load_tracker_index()
+    all_jobs = [r for r in tracker["rows"] if r.get("url")]
+    tracked_urls = sheets.get_tracked_li_urls()  # already in Sent sheet (any status)
+    logger.info("Tracker rows with a job URL: %d", len(all_jobs))
+
+    # ── Fetch recent connections ───────────────────────────────────────────────
     async with async_playwright() as p:
         browser, context = await li.make_browser_context(p)
         try:
-            ok = await li.load_cookies(context)
-            if not ok:
+            if not await li.load_cookies(context):
                 logger.error("No cookies available. Run save_cookies.py first.")
                 return
-
             page = await context.new_page()
-
             if not await li.is_logged_in(page):
                 logger.error("LinkedIn session expired. Re-run save_cookies.py.")
                 return
 
-            old_snapshot = sheets.load_snapshot_from_sheet()
-            logger.info("Snapshot loaded: %d previously seen connections", len(old_snapshot))
-
-            current = await li.get_connections(page, old_snapshot)
-
-            # ── Pass 1: headline extraction ────────────────────────────────────
-            headline_filled = 0
-            for conn in current.values():
-                if conn.get("current_company"):
-                    continue
-                headline = conn.get("headline", "")
-                extracted = m.extract_company_from_headline(headline)
-                if extracted and extracted != headline.strip():
-                    conn["current_company"] = extracted
-                    headline_filled += 1
-            logger.info("Headline extraction filled company for %d connections", headline_filled)
-
-            for url, snap_conn in old_snapshot.items():
-                if url in current and not current[url].get("current_company"):
-                    stored = snap_conn.get("current_company", "")
-                    if stored:
-                        current[url]["current_company"] = stored
-
-            new_connections = li.diff_connections(old_snapshot, current)
-            logger.info("New connections since last poll: %d", len(new_connections))
-
-            if new_connections:
-                applied_rows = sheets.get_applied_companies()
-                logger.info("Applied rows in sheet: %d", len(applied_rows))
-
-                for conn in new_connections:
-                    headline        = conn.get("headline", "")
-                    current_company = conn.get("current_company", "")
-                    company_hint    = m.extract_company_from_headline(headline)
-
-                    logger.info(
-                        "New connection: %s | headline: '%s' | extracted: '%s' | company: '%s'",
-                        conn["name"], headline, company_hint, current_company,
-                    )
-
-                    matched_row = m.find_matching_row(company_hint, applied_rows)
-                    if not matched_row and current_company:
-                        matched_row = m.find_matching_row(current_company, applied_rows)
-
-                    if matched_row:
-                        logger.info(
-                            "Matched! %s → %s @ %s — adding to Sent sheet",
-                            conn["name"], matched_row["role"], matched_row["company"],
-                        )
-                        sheets.add_pending_to_sent_sheet(
-                            li_name=conn["name"],
-                            li_url=conn["url"],
-                            company=matched_row["company"],
-                            role=matched_row["role"],
-                            job_url=matched_row.get("url", ""),
-                        )
-                    else:
-                        logger.info("No sheet match for connection: %s", conn["name"])
-
-            # ── Pass 2: log connections still missing a company ───────────────
-            still_empty = [
-                conn["name"] for conn in current.values()
-                if not conn.get("current_company")
-            ]
-            if still_empty:
-                logger.info(
-                    "%d connections have no company: %s",
-                    len(still_empty), ", ".join(still_empty),
-                )
-
-            # ── Pass 3: Multi-referral — add ALL connections at target companies to Sent ─
-            all_jobs     = sheets.get_all_jobs()
-            tracked_urls = sheets.get_tracked_li_urls()
-            new_referrals = 0
-
-            if all_jobs:
-                for conn in current.values():
-                    li_url = conn["url"]
-                    li_norm = sheets.normalize_li_url(li_url)
-                    if li_norm in tracked_urls:
-                        continue
-
-                    company      = conn.get("current_company", "")
-                    company_hint = m.extract_company_from_headline(conn.get("headline", ""))
-
-                    matched = None
-                    if company:
-                        matched = m.find_matching_row(company, all_jobs)
-                    if not matched and company_hint and company_hint != conn.get("headline", "").strip():
-                        matched = m.find_matching_row(company_hint, all_jobs)
-
-                    if matched:
-                        logger.info(
-                            "Multi-referral: %s → %s @ %s",
-                            conn["name"], matched["role"], matched["company"],
-                        )
-                        sheets.add_pending_to_sent_sheet(
-                            li_name=conn["name"],
-                            li_url=li_url,
-                            company=matched["company"],
-                            role=matched["role"],
-                            job_url=matched.get("url", ""),
-                        )
-                        tracked_urls.add(li_norm)
-                        new_referrals += 1
-
-            if new_referrals:
-                logger.info("Multi-referral: added %d new pending rows to Sent sheet", new_referrals)
-
-            sheets.save_snapshot_to_sheet(current)
-            logger.info("Snapshot saved to Sheets: %d connections", len(current))
-
+            new_people = await li.get_recent_connections(
+                page,
+                max_connections=MAX_POLL_CONNECTIONS,
+                known_urls=known_urls,
+            )
         finally:
             await browser.close()
 
+    logger.info("New connections to process: %d", len(new_people))
+
+    added = 0
+    for conn in new_people:
+        name = conn["name"]
+        url = conn["url"]
+        headline = conn.get("headline", "")
+
+        company = m.extract_company_from_headline(headline)
+        logger.info("New: %s | headline='%s' | company='%s'", name, headline[:60], company)
+
+        # Record in snapshot regardless of match, so we never reprocess this person.
+        snapshot[url] = {
+            "url": url, "name": name, "headline": headline, "current_company": company,
+        }
+
+        if not company:
+            continue
+
+        matched = m.find_matching_row(company, all_jobs)
+        if not matched:
+            logger.info("  no Tracker match for %s", name)
+            continue
+
+        # Only queue if the application is within the 12-day window.
+        if not sheets.within_window_from_index(
+            tracker, matched["company"], matched.get("url", ""), MESSAGE_APPLY_WITHIN_DAYS
+        ):
+            logger.info(
+                "  %s matched %s but application is outside the %d-day window — skipping",
+                name, matched["company"], MESSAGE_APPLY_WITHIN_DAYS,
+            )
+            continue
+
+        if sheets.add_pending_to_sent_sheet(
+            li_name=name,
+            li_url=url,
+            company=matched["company"],
+            role=matched["role"],
+            job_url=matched.get("url", ""),
+            tracked_urls=tracked_urls,
+            check_window=False,  # already checked above with the preloaded index
+        ):
+            added += 1
+            logger.info("  queued: %s → %s @ %s", name, matched["role"], matched["company"])
+
+    # ── Save snapshot ONCE ─────────────────────────────────────────────────────
+    sheets.save_snapshot_to_sheet(snapshot)
+    logger.info("Snapshot saved: %d connections | %d new pending rows", len(snapshot), added)
     logger.info("=== poll_connections complete ===")
 
 
@@ -239,6 +178,9 @@ async def send_messages():
         logger.info("Nothing to send.")
         return
 
+    # Load state ONCE (avoids per-row sheet reads that trip the quota).
+    tracker = sheets.load_tracker_index()
+
     # One-time session check
     async with async_playwright() as p:
         browser, context = await li.make_browser_context(p)
@@ -264,24 +206,17 @@ async def send_messages():
         li_name     = row["li_name"]
         first_name  = li_name.split()[0] if li_name else "there"
 
-        # Re-check the sheet right before sending (catches cross-run duplicates)
+        # Skip if we've already sent to this person (dedup gate, in-memory set).
         li_norm = sheets.normalize_li_url(profile_url)
         if li_norm in already_sent:
-            logger.info("Skipping %s — already sent (duplicate row), marking as Message Sent", li_name)
+            logger.info("Skipping %s — already sent; marking Message Sent", li_name)
             sheets.mark_sent_in_sent_sheet(row["row_index"])
             sheets.update_tracker_status_for_company(company, sheets.STATUS_SENT)
             continue
 
-        # Fresh check from sheet to catch if another run already sent this
-        fresh_sent = sheets.get_sent_li_urls()
-        if li_norm in fresh_sent:
-            logger.info("Skipping %s — already sent (detected from sheet refresh)", li_name)
-            sheets.mark_sent_in_sent_sheet(row["row_index"])
-            already_sent.add(li_norm)
-            continue
-
-        if not sheets.application_is_within_messaging_window(
-            company, row.get("job_url", ""), MESSAGE_APPLY_WITHIN_DAYS
+        # 12-day window check using the preloaded tracker index (no network read).
+        if not sheets.within_window_from_index(
+            tracker, company, row.get("job_url", ""), MESSAGE_APPLY_WITHIN_DAYS
         ):
             logger.info(
                 "Skipping %s — application for %s is outside the last %d days (Tracker Applied Date); marking Outside Message Window",

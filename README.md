@@ -38,11 +38,13 @@ All automated. Runs on GitHub Actions. No manual follow-ups.
 ```
 
 **Flow:**
-- You log applications in a sheet (Company, Role, Job URL, Status)
-- Poll runs every 6 hours: scrapes connections, diffs against last snapshot, matches new connections to your applied companies
-- When a connection matches → row becomes "Pending Message"
-- Send runs weekdays at 9 AM MST: fetches resume from Drive, sends DM with your template
-- Status updates: Applied → Pending Message → Message Sent
+- You log applications in the Tracker sheet (Applied Date, Company, Role, Job URL, Status)
+- Poll runs every 6 hours: fetches the most recent connections (up to `MAX_POLL_CONNECTIONS`), skips anyone already in the snapshot, and for each new person extracts their company from the headline using GPT-4o-mini (regex fallback if no API key)
+- If the company matches a Tracker row **and** the application is within the 12-day window → a "Pending Message" row is added to the Sent sheet
+- Send runs weekdays at 9 AM MST: fetches the resume from Drive, sends one DM, then marks "Message Sent" in **both** the Sent sheet and the Tracker
+- Status flow: Applied → Pending Message → Message Sent
+
+**Quota-safe:** the Tracker and Sent sheets are each read once per run (not per connection), with exponential backoff on HTTP 429.
 
 ---
 
